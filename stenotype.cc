@@ -854,11 +854,12 @@ int Main2(int argc, char** argv) {
 
   // Error buffer
   char errbuff[PCAP_ERRBUF_SIZE];
-
+    
+  // Number of packets
   uint32_t pkt_count = 0;
-  // Open file and create pcap handler
 
-  std::string pkt_dirname = flag_dir + "PKT/" + flag_src;
+  // Open file and create pcap handler
+  std::string pkt_dirname = flag_dir + "Pcap/" + flag_src;
   pcap_t *const handler = pcap_open_offline(pkt_dirname.c_str(), errbuff);
  
   // pcap_t *const handler = pcap_open_offline(flag_src.c_str(), errbuff);
@@ -875,18 +876,6 @@ int Main2(int argc, char** argv) {
   // Increase by 28 (bytes) to go to the raw packet data instead
   uint64_t packet_offset = MIN_SHB_IDB_LEN; 
 
-  // Open pcapng file to write byte by byte
-  std::string pcapng_filename = flag_dir + "PcapNG/" + flag_src + "ng";
-  LOG(INFO) << "Opening " << pcapng_filename;
-  std::ofstream file(pcapng_filename);  
-  if (!file.is_open()) {
-    std::cout << "Error: Unable to open the pcap file." << std::endl;
-  } else {
-    int numCharacters = MIN_SHB_IDB_LEN;
-    // Section Header Block & Interface Description Block
-    file.write((const char*)pcapng_header, numCharacters);  
-  }
-
   // Index of index file
   Index* index = NULL;
   int64_t micros = GetCurrentTimeMicros();
@@ -896,6 +885,18 @@ int Main2(int argc, char** argv) {
   } else {
     LOG(ERROR) << "Indexing turned off";
   }  
+
+  // Open pcapng file to write byte by byte
+  std::string pcapng_filename = flag_dir + "PKT/" + std::to_string(micros);
+  LOG(INFO) << "Opening " << pcapng_filename;
+  std::ofstream file(pcapng_filename);  
+  if (!file.is_open()) {
+    std::cout << "Error: Unable to open the pcap file." << std::endl;
+  } else {
+    int numCharacters = MIN_SHB_IDB_LEN;
+    // Section Header Block & Interface Description Block
+    file.write((const char*)pcapng_header, numCharacters);  
+  }
 
   // Looping through each packet
   while (pcap_next_ex(handler, &header_pcap, &full_packet) >= 0) {
@@ -909,7 +910,7 @@ int Main2(int argc, char** argv) {
     index->ProcessRaw(ep_block + 28, packet_offset, epb_len - 32);
 
     pkt_count++;
-    // LOG(INFO) << "Offset at packet #" << index->packets_ << " = " << packet_offset;    
+    //// LOG(INFO) << "Offset at packet #" << pkt_count << " = " << packet_offset;    
 
     // This offset currently pointed at block's start
     // Increase by 28 bytes to go to the raw packet data instead
@@ -918,14 +919,6 @@ int Main2(int argc, char** argv) {
 
   LOG(INFO) << "Total packets in file: " << pkt_count << "\n";  
   // LOG(INFO) << "Total packets processed: " << index->packets_ << "\n";  
-   
-  // LOG(INFO) << "index port size: " << index->port_.size();    
-  // LOG(INFO) << "index ipv4 size: " << index->ip4_.size();    
-  // LOG(INFO) << "index ipv6 size: " << index->ip6_.size();    
-  // LOG(INFO) << "index proto size: " << index->proto_.size(); 
-  // pid_t tid = syscall(SYS_gettid);
-  // LOG_IF_ERROR(Errno(setpriority(PRIO_PROCESS, tid, flag_index_nicelevel)), "setpriority");
-  // DropIndexThreadPrivileges();
 
   LOG_IF_ERROR(index->Flush2(), "index flush");
   delete index;
