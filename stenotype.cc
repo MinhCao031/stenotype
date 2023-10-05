@@ -70,6 +70,7 @@
 #include <sys/syscall.h>      // syscall(), SYS_gettid
 #include <unistd.h>           // setuid(), setgid(), getpagesize()
 
+#include <dirent.h>
 #include <fstream>
 #include <iostream>
 #include <string>
@@ -85,12 +86,14 @@
 #include "packets.h"
 #include "util.h"
 
+// namespace fs = std::system;
+
 namespace {
 
 std::string flag_iface = "eth0";
 std::string flag_filter = "";
 std::string flag_dir = "";
-std::string flag_src = "";
+std::string flag_src = "Pcap";
 int64_t flag_count = -1;
 int32_t flag_blocks = 2048;
 int32_t flag_aiops = 128;
@@ -218,8 +221,8 @@ void ParseOptions(int argc, char** argv) {
       {0, 'q', 0, 0, "Quiet logging.  Each -q counteracts one -v"},
       {"iface", 300, s, 0, "Interface to read packets from"},
       {"dir", 301, s, 0, "Directory to store packet files in"},
-      {"count", 302, n, 0,
-       "Total number of packets to read, -1 to read forever"},
+      {"dir_pcap", 324, s, 0, "Directory inside [dir] to read all pcap files"},
+      {"count", 302, n, 0, "Total number of packets to read, -1 to read forever"},
       {"blocks", 303, n, 0, "Total number of blocks to use, each is 1MB"},
       {"aiops", 304, n, 0, "Max number of async IO operations"},
       {"filesize_mb", 305, n, 0, "Max file size in MB before file is rotated"},
@@ -250,7 +253,6 @@ void ParseOptions(int argc, char** argv) {
       {"no_promisc", 321, 0, 0, "Don't set promiscuous mode"},
       {"stats_blocks", 322, n, 0, "Size block stats will be displayed, requires verbose, default 100, 0 disables"},
       {"stats_sec", 323, n, 0, "Seconds stats will be displayed, requires verbose, default 60, 0 disables"},
-      {"pcap_file", 324, s, 0, "Pcap file to read from"},
       {0},
   };
   struct argp argp = {options, &ParseOptions};
@@ -748,19 +750,6 @@ const unsigned char pcapng_header[] = {
     0x14, 0x00, 0x00, 0x00
 };
 
-void WriteIndexer(st::Index* index) {
-  pid_t tid = syscall(SYS_gettid);
-  LOG_IF_ERROR(Errno(setpriority(PRIO_PROCESS, tid, flag_index_nicelevel)), "setpriority");
-  DropIndexThreadPrivileges();
-
-  if (index) {
-    LOG_IF_ERROR(index->Flush(), "index flush");
-    LOG(INFO) << "Wrote index " << int64_t(index);
-    delete index;
-  }
-  LOG(INFO) << "End of function";
-}
-
 unsigned char* get_ep_block(struct pcap_pkthdr *header_pcap, unsigned char const* full_packet, uint32_t* epb_len) {
   uint32_t pkt_leng = header_pcap->caplen;
   uint32_t blocklen = pkt_leng + 32;
@@ -838,7 +827,7 @@ bool isFilePcap(std::string s) {
   return true;
 }
 
-int Main2(int argc, char** argv) {
+int MainPcap(int argc, char** argv) {
   // LOG_IF_ERROR(Errno(prctl(PR_SET_PDEATHSIG, SIGTERM)), "prctl PDEATHSIG");
   ParseOptions(argc, argv);
   std::cout << "Stenotype running with these arguments:\n";
@@ -847,87 +836,105 @@ int Main2(int argc, char** argv) {
   }
 
   CHECK(flag_dir != "");
-  CHECK(isFilePcap(flag_src));
-
+  CHECK(flag_src != "");
   if (flag_dir[flag_dir.size() - 1] != '/')
     flag_dir += "/";
+  if (flag_src[flag_src.size() - 1] != '/')
+    flag_src += "/";
 
-  // Error buffer
-  char errbuff[PCAP_ERRBUF_SIZE];
+  // Folder containing pcap files
+  std::string pcap_folder = flag_dir + flag_src;
+
+  DIR* directory = opendir(pcap_folder.c_str());
+  if (!directory) {
+    std::cout << "Failed to open the directory: " << pcap_folder << std::endl;
+    return 1;
+  }
+
+  dirent* entry;
+  while ((entry = readdir(directory)) != NULL) {
+    if (entry->d_type != DT_REG) {
+      LOG(INFO) << "Skipped non-regular file: [" << entry->d_type << "]\n";
+      continue;
+    }
+    std::string pcap_file_name(entry->d_name);
+    if (!isFilePcap(pcap_file_name)) {
+      LOG(INFO) << "Skipped non-pcap file: [" << pcap_file_name << "]\n";
+      continue;
+    }    
+
+    // Error buffer
+    char errbuff[PCAP_ERRBUF_SIZE];
+    uint32_t pkt_count = 0;
+
+    std::string pcap_file_path = pcap_folder + pcap_file_name;
     
-  // Number of packets
-  uint32_t pkt_count = 0;
+    // Open file and create pcap handler
+    pcap_t *const handler = pcap_open_offline(pcap_file_path.c_str(), errbuff);
+  
+    if (handler == NULL) {
+      fprintf(stderr, "Error opening file %s with error: %s\t-> Skipped\n", argv[1], errbuff);
+      continue;
+    }
 
-  // Open file and create pcap handler
-  std::string pkt_dirname = flag_dir + "Pcap/" + flag_src;
-  pcap_t *const handler = pcap_open_offline(pkt_dirname.c_str(), errbuff);
- 
-  // pcap_t *const handler = pcap_open_offline(flag_src.c_str(), errbuff);
-  if (handler == NULL) {
-    fprintf(stderr, "Error opening file %s with error: %s\n\n", argv[1], errbuff);
-    exit(EXIT_FAILURE);
+    // The header that pcap gives us
+    struct pcap_pkthdr *header_pcap;
+    // The actual packet
+    unsigned char const* full_packet;
+    // This offset originally pointed at the 1st enhanced packet block's start
+    // Increase by 28 (bytes) to go to the raw packet data instead
+    uint64_t packet_offset = MIN_SHB_IDB_LEN; 
+
+    // Index of index file
+    Index* index = NULL;
+    int64_t micros = GetCurrentTimeMicros();
+    if (flag_index) {
+      index = new Index(flag_dir, micros);
+    } else {
+      LOG(ERROR) << "Indexing turned off";
+    }  
+
+    // Open pcapng file to write byte by byte
+    std::string pcapng_file_path = flag_dir + "PKT/" + std::to_string(micros);
+    std::ofstream file(pcapng_file_path);  
+    if (!file.is_open()) {
+      std::cout << "Error: Unable to open the pcapng file: " << pcapng_file_path << std::endl;
+    } else {
+      int numCharacters = MIN_SHB_IDB_LEN;
+      // Section Header Block & Interface Description Block
+      file.write((const char*)pcapng_header, numCharacters);  
+    }
+    
+    // Looping through each packet
+    while (pcap_next_ex(handler, &header_pcap, &full_packet) >= 0) {
+      uint32_t epb_len = 32;
+      unsigned char* ep_block = get_ep_block(header_pcap, full_packet, &epb_len);
+
+      // Write the enhanced packet block to pcapng file
+      file.write((const char*)ep_block, epb_len);  
+
+      // Add packet's key to level-db
+      index->ProcessRaw(ep_block + 28, packet_offset, epb_len - 32);
+
+      pkt_count++; // LOG(INFO) << "Offset at packet #" << index->packets_ << " = " << packet_offset;    
+
+      // This offset currently pointed at block's start
+      // Increase by 28 bytes to go to the raw packet data instead
+      packet_offset += epb_len;
+    }
+
+    LOG(INFO) << "Total " << pkt_count << " packets in " << pcap_file_name;  
+    LOG_IF_ERROR(index->Flush2(), "index flush");
+    delete index;
+
+    // Close pcapng file
+    file.close();
   }
 
-  // The header that pcap gives us
-  struct pcap_pkthdr *header_pcap;
-  // The actual packet
-  unsigned char const* full_packet;
-  // This offset originally pointed at the 1st enhanced packet block's start
-  // Increase by 28 (bytes) to go to the raw packet data instead
-  uint64_t packet_offset = MIN_SHB_IDB_LEN; 
-
-  // Index of index file
-  Index* index = NULL;
-  int64_t micros = GetCurrentTimeMicros();
-  if (flag_index) {
-    index = new Index(flag_dir, micros);
-    LOG(INFO) << "Index at dir=" << flag_dir;
-  } else {
-    LOG(ERROR) << "Indexing turned off";
-  }  
-
-  // Open pcapng file to write byte by byte
-  std::string pcapng_filename = flag_dir + "PKT/" + std::to_string(micros);
-  LOG(INFO) << "Opening " << pcapng_filename;
-  std::ofstream file(pcapng_filename);  
-  if (!file.is_open()) {
-    std::cout << "Error: Unable to open the pcap file." << std::endl;
-  } else {
-    int numCharacters = MIN_SHB_IDB_LEN;
-    // Section Header Block & Interface Description Block
-    file.write((const char*)pcapng_header, numCharacters);  
-  }
-
-  // Looping through each packet
-  while (pcap_next_ex(handler, &header_pcap, &full_packet) >= 0) {
-    uint32_t epb_len = 32;
-    unsigned char* ep_block = get_ep_block(header_pcap, full_packet, &epb_len);
-
-    // Write the enhanced packet block to pcapng file
-    file.write((const char*)ep_block, epb_len);  
-
-    // Add packet's key to level-db
-    index->ProcessRaw(ep_block + 28, packet_offset, epb_len - 32);
-
-    pkt_count++;
-    //// LOG(INFO) << "Offset at packet #" << pkt_count << " = " << packet_offset;    
-
-    // This offset currently pointed at block's start
-    // Increase by 28 bytes to go to the raw packet data instead
-    packet_offset += epb_len;
-  }
-
-  LOG(INFO) << "Total packets in file: " << pkt_count << "\n";  
-  // LOG(INFO) << "Total packets processed: " << index->packets_ << "\n";  
-
-  LOG_IF_ERROR(index->Flush2(), "index flush");
-  delete index;
-
-  // Close pcapng file
-  file.close();
+  closedir(directory);
   return 0;
 }
 
 } // namespace st
 
-int main(int argc, char** argv) { return st::Main2(argc, argv); }
+int main(int argc, char** argv) { return st::MainPcap(argc, argv); }

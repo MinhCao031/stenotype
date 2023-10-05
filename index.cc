@@ -441,7 +441,7 @@ void WriteToIndex(char first, const char* start, int size,
 
   std::string bufhex = stringToHex((const unsigned char*)buf, 1+size);
   int num_val = val.size();
-  LOG(INFO) << bufhex << "\tNumVal = " << num_val << std::hex << "\tFrom " << val[0] << "\tto " << val[num_val-1];
+  // LOG(INFO) << bufhex << "\tNumVal = " << num_val << std::hex << "\tFrom " << val[0] << "\tto " << val[num_val-1];
 
   // leveldb::Slice key(buf, size + 1);
   // leveldb::Slice value = ValueFromVector(val);
@@ -491,7 +491,6 @@ Error Index::Flush2() {
   leveldb::WritableFile* file = NULL;
   std::string filename = dirname_ + "IDX/" + std::to_string(micros_);
   auto status = leveldb::Env::Default()->NewWritableFile(filename, &file);
-  std::cout << "Opening " << filename << "\n";
   if (!status.ok()) {
     return ERROR("could not open '" + filename + "': " + status.ToString());
   }
@@ -499,11 +498,11 @@ Error Index::Flush2() {
 
   RETURN_IF_ERROR(WriteTo(file), "writing index " + filename);
 
-  LOG(INFO) << "Wrote all index files for " << filename << "\n";
-  LOG(INFO) << "Stored " << packets_ << " with " << ip4_.size() << " IP4 "
-          << ip6_.size() << " IP6 " << proto_.size() << " protos "
-          << port_.size() << " ports " << vlan_.size() << " vlan "
-          << mpls_.size() << " mpls";
+  LOG(INFO) << "Wrote all index files for " << filename;
+  LOG(INFO) << "Stored " << packets_ << " with " << ip4_.size() << " IP4, "
+          << ip6_.size() << " IP6, " << proto_.size() << " protos, "
+          << port_.size() << " ports, " << vlan_.size() << " vlan, "
+          << mpls_.size() << " mpls\n";
   return SUCCESS;
 }
 
@@ -530,22 +529,22 @@ Error Index::WriteTo(leveldb::WritableFile* file) {
     }                                                                     \
   } while (0)
 
-  LOG(INFO) << "List data for kIndexProtocol\n";
+  // LOG(INFO) << "List data for kIndexProtocol\n";
   WRITE_TO_INDEX(proto, , kIndexProtocol, 1);
-  LOG(INFO) << "List data for kIndexPort\n";
+  // LOG(INFO) << "List data for kIndexPort\n";
   WRITE_TO_INDEX(port, htons, kIndexPort, 2);
-  LOG(INFO) << "List data for kIndexVLAN\n";
+  // LOG(INFO) << "List data for kIndexVLAN\n";
   WRITE_TO_INDEX(vlan, htons, kIndexVLAN, 2);
-  LOG(INFO) << "List data for kIndexIPv4\n";
+  // LOG(INFO) << "List data for kIndexIPv4\n";
   WRITE_TO_INDEX( ip4, htonl, kIndexIPv4, 4);
-  LOG(INFO) << "List data for kIndexMPLS\n";
+  // LOG(INFO) << "List data for kIndexMPLS\n";
   WRITE_TO_INDEX(mpls, htonl, kIndexMPLS, 4);
 
 #undef WRITE_TO_INDEX
 
   for (auto iter : ip6_) {
     auto ip6 = iter.first.data();
-    LOG(INFO) << "List data for kIndexIPv6\n";
+    // LOG(INFO) << "List data for kIndexIPv6\n";
     WriteToIndex(kIndexIPv6, ip6, 16, iter.second, &index_ss);
   }
 
