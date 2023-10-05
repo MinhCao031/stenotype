@@ -86,14 +86,14 @@
 #include "packets.h"
 #include "util.h"
 
-// namespace fs = std::system;
+#define MIN_SHB_IDB_LEN 48
 
 namespace {
 
 std::string flag_iface = "eth0";
 std::string flag_filter = "";
 std::string flag_dir = "";
-std::string flag_src = "Pcap";
+std::string flag_pcap = "./log/Pcap";
 int64_t flag_count = -1;
 int32_t flag_blocks = 2048;
 int32_t flag_aiops = 128;
@@ -207,7 +207,7 @@ int ParseOptions(int key, char* arg, struct argp_state* state) {
       flag_stats_sec = atoi(arg);
       break;
     case 324:
-      flag_src = arg;
+      flag_pcap = arg;
       break;
   }
   return 0;
@@ -221,7 +221,7 @@ void ParseOptions(int argc, char** argv) {
       {0, 'q', 0, 0, "Quiet logging.  Each -q counteracts one -v"},
       {"iface", 300, s, 0, "Interface to read packets from"},
       {"dir", 301, s, 0, "Directory to store packet files in"},
-      {"dir_pcap", 324, s, 0, "Directory inside [dir] to read all pcap files"},
+      {"dir_pcap", 324, s, 0, "Directory to read all pcap files"},
       {"count", 302, n, 0, "Total number of packets to read, -1 to read forever"},
       {"blocks", 303, n, 0, "Total number of blocks to use, each is 1MB"},
       {"aiops", 304, n, 0, "Max number of async IO operations"},
@@ -568,178 +568,6 @@ void RunThread(int thread, st::ProducerConsumerQueue* write_index,
   LOG(INFO) << "Finished thread " << thread << " successfully";
 }
 
-int Main(int argc, char** argv) {
-  LOG_IF_ERROR(Errno(prctl(PR_SET_PDEATHSIG, SIGTERM)), "prctl PDEATHSIG");
-  ParseOptions(argc, argv);
-  VLOG(1) << "Stenotype running with these arguments:";
-  for (int i = 0; i < argc; i++) {
-    VLOG(1) << i << ":\t\"" << argv[i] << "\"";
-  }
-  LOG(INFO) << "#001. Starting, page size is " << getpagesize();
-
-  // Sanity check flags and setup options.
-  CHECK(flag_filesize_mb <= 4 << 10);
-  CHECK(flag_filesize_mb > 1);
-  CHECK(flag_filesize_mb >= flag_aiops);
-  CHECK(flag_blocks >= 16);  // arbitrary lower limit.
-  CHECK(flag_threads >= 1);
-  CHECK(flag_aiops <= flag_blocks);
-  CHECK(flag_dir != "");
-  CHECK(flag_blockage_sec <= flag_fileage_sec);
-  CHECK(flag_blockage_sec > 0);
-  CHECK(flag_fileage_sec % flag_blockage_sec == 0);
-  CHECK(flag_blocksize_kb >= 10);
-  CHECK(flag_blocksize_kb * 1024 >= (uint64_t)(getpagesize()));
-  CHECK((flag_blocksize_kb * 1024) % (uint64_t)(getpagesize()) == 0);
-  if (flag_dir[flag_dir.size() - 1] != '/') {
-    flag_dir += "/";
-  }
-
-  // Before we drop any privileges, set up our sniffing sockets.
-  // We have to do this before calling DropPrivileges, which does a
-  // setuid/setgid and could lose us the ability to do this at a later date.
-
-  std::vector<Packets*> sockets;
-  for (int i = 0; i < flag_threads; i++) {
-    if (flag_testimony.empty()) {
-      LOG(INFO) << "#002. Setting up AF_PACKET sockets for packet reading";
-      int socktype = SOCK_RAW;
-      struct tpacket_req3 options;
-      memset(&options, 0, sizeof(options));
-      options.tp_block_size = flag_blocksize_kb * 1024;
-      options.tp_block_nr = flag_blocks;
-      options.tp_frame_size = flag_blocksize_kb * 1024;  // doesn't matter
-      options.tp_frame_nr = 0;                           // computed for us.
-      options.tp_retire_blk_tov = flag_blockage_sec * kNumMillisPerSecond - 1;
-
-      // Set up AF_PACKET packet reading.
-      PacketsV3::Builder builder;
-      CHECK_SUCCESS(builder.SetUp(socktype, options));
-      CHECK_SUCCESS(builder.SetPromisc(flag_promisc));
-      int fanout_id = getpid();
-      if (flag_fanout_id > 0) {
-        fanout_id = flag_fanout_id;
-      }
-      if (flag_fanout_id > 0 || flag_threads > 1) {
-        CHECK_SUCCESS(builder.SetFanout(flag_fanout_type, fanout_id));
-      }
-      if (!flag_filter.empty()) {
-        CHECK_SUCCESS(builder.SetFilter(flag_filter));
-      }
-      Packets* v3;
-      CHECK_SUCCESS(builder.Bind(flag_iface, &v3));
-      sockets.push_back(v3);
-    } else {
-#ifdef TESTIMONY
-      LOG(INFO) << "Connecting to testimony socket for packet reading";
-      testimony t;
-      CHECK_SUCCESS(NegErrno(testimony_connect(&t, flag_testimony.c_str())));
-      CHECK(flag_threads == testimony_conn(t)->fanout_size)
-          << "--threads does not match testimony fanout size";
-      CHECK(testimony_conn(t)->block_size == flag_blocksize_kb * 1024)
-          << "Testimony does not supply blocks of size " << flag_blocksize_kb
-          << "KB";
-      testimony_conn(t)->fanout_index = i;
-      CHECK_SUCCESS(NegErrno(testimony_init(t)));
-      sockets.push_back(new TestimonyPackets(t));
-#else
-      LOG(FATAL) << "invalid --testimony flag, testimony not compiled in";
-#endif
-    }
-    LOG(INFO) << "#003. Setting up AF_PACKET sockets for packet reading: DONE";
-  }
-
-  // To be safe, also set umask before any threads are created.
-  umask(0077);
-
-  // Now that we have sockets, drop privileges.
-  // We HAVE to do this before we start any threads, since it's unclear whether
-  // setXid will set the IDs for the all process threads or just the current
-  // one.  This should also be done before signal masking, because apparently
-  // sometimes Linux sends a SIGSETXID signal to threads during this, and if
-  // that is ignored setXid will hang forever.
-  LOG(INFO) << "#004. Dropping priviliges...";
-  DropPrivileges();
-
-  // Start a thread whose sole purpose is to handle signals.
-  // Signal handling in a multi-threaded application is HARD.  This binary
-  // wants to handle signals very simply:  one thread catches SIGINT/SIGTERM and
-  // sets a bool accordingly.  However, Linux will deliver the signal to one
-  // (random) thread.  How to handle this?  First, we create the one single
-  // thread that is going to get signals...
-  LOG(INFO) << "#005. Create the one single thread that is going to get signals";
-  std::thread signal_thread(&HandleSignalsThread);
-  signal_thread.detach();
-  // ... Then, we block those signals from being handled by this thread or any
-  // of its children.  All other threads MUST be created after this.
-  LOG(INFO) << "#006. Block those signals from being handled by this thread. All other threads MUST be created after this.";
-  sigset_t sigset;
-  sigemptyset(&sigset);
-  sigaddset(&sigset, SIGINT);
-  sigaddset(&sigset, SIGTERM);
-  CHECK_SUCCESS(Errno(pthread_sigmask(SIG_BLOCK, &sigset, NULL)));
-
-  // Now, we can finally start the threads that read in packets, index them, and
-  // write them to disk.
-  LOG(INFO) << "#007. Start the threads that read in packets, index them, and write them to disk.";
-  auto write_indexes = new st::ProducerConsumerQueue[flag_threads];
-  VLOG(1) << "Starting writing threads";
-  std::vector<std::thread*> threads;
-  for (int i = 0; i < flag_threads; i++) {
-    VLOG(1) << "Starting thread " << i;
-    threads.push_back(
-        new std::thread(&RunThread, i, &write_indexes[i], sockets[i]));
-  }
-
-  // To avoid blocking on index writes, each writer thread has a secondary
-  // thread just for creating and writing the indexes.  We pass to-write
-  // indexes through to the writing thread via the write_index FIFO queue.
-  // TODO(gconnell):  Move index writing thread creation into RunThread.
-  std::vector<std::thread*> index_threads;
-  if (flag_index) {
-    VLOG(1) << "Starting indexing threads";
-    for (int i = 0; i < flag_threads; i++) {
-      std::thread* t = new std::thread(&WriteIndexes, i, &write_indexes[i]);
-      index_threads.push_back(t);
-    }
-    LOG(INFO) << "#008. Starting indexing threads: Writer thread DONE";
-  }
-
-  // Drop all privileges we need.  Note: we because of what we've already done,
-  // we really don't need much anymore.  No need to create new threads, to write
-  // files, to open sockets... we basically just hang around waiting for all the
-  // other threads to finish.
-  DropCommonThreadPrivileges();
-
-  for (auto thread : threads) {
-    VLOG(1) << "===============Waiting for thread==============";
-    LOG(INFO) << "#009. A thread is joining...";
-    CHECK(thread->joinable());
-    thread->join();
-    VLOG(1) << "Thread finished";
-    LOG(INFO) << "#009. A thread is finished";
-    delete thread;
-  }
-  VLOG(1) << "Finished all threads";
-  LOG(INFO) << "#009. Finished all threads";
-  if (flag_index) {
-    for (int i = 0; i < flag_threads; i++) {
-      VLOG(1) << "Closing write index queue " << i << ", waiting for thread";
-      write_indexes[i].Close();
-      CHECK(index_threads[i]->joinable());
-      index_threads[i]->join();
-      VLOG(1) << "Index thread finished";
-      delete index_threads[i];
-    }
-  }
-  delete[] write_indexes;
-  LOG(INFO) << "#010. Process exiting successfully";
-  main_complete.Notify();
-  return 0;
-}
-
-#define MIN_SHB_IDB_LEN 48
-
 const unsigned char pcapng_header[] = {
     0x0A, 0x0D, 0x0D, 0x0A, 0x1C, 0x00, 0x00, 0x00,
     0x4D, 0x3C, 0x2B, 0x1A, 0x01, 0x00, 0x00, 0x00,
@@ -749,6 +577,17 @@ const unsigned char pcapng_header[] = {
     0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x04, 0x00,
     0x14, 0x00, 0x00, 0x00
 };
+
+bool isFilePcap(std::string s) {
+  int n = s.length();
+  if (n < 5) return false;
+  if (s[n-5] != '.') return false;
+  if (s[n-4] != 'p') return false;
+  if (s[n-3] != 'c') return false;
+  if (s[n-2] != 'a') return false;
+  if (s[n-1] != 'p') return false;
+  return true;
+}
 
 unsigned char* get_ep_block(struct pcap_pkthdr *header_pcap, unsigned char const* full_packet, uint32_t* epb_len) {
   uint32_t pkt_leng = header_pcap->caplen;
@@ -816,18 +655,7 @@ unsigned char* get_ep_block(struct pcap_pkthdr *header_pcap, unsigned char const
   return ep_block;
 }
 
-bool isFilePcap(std::string s) {
-  int n = s.length();
-  if (n < 5) return false;
-  if (s[n-5] != '.') return false;
-  if (s[n-4] != 'p') return false;
-  if (s[n-3] != 'c') return false;
-  if (s[n-2] != 'a') return false;
-  if (s[n-1] != 'p') return false;
-  return true;
-}
-
-int MainPcap(int argc, char** argv) {
+int Main(int argc, char** argv) {
   // LOG_IF_ERROR(Errno(prctl(PR_SET_PDEATHSIG, SIGTERM)), "prctl PDEATHSIG");
   ParseOptions(argc, argv);
   std::cout << "Stenotype running with these arguments:\n";
@@ -836,18 +664,15 @@ int MainPcap(int argc, char** argv) {
   }
 
   CHECK(flag_dir != "");
-  CHECK(flag_src != "");
+  CHECK(flag_pcap != "");
   if (flag_dir[flag_dir.size() - 1] != '/')
     flag_dir += "/";
-  if (flag_src[flag_src.size() - 1] != '/')
-    flag_src += "/";
+  if (flag_pcap[flag_pcap.size() - 1] != '/')
+    flag_pcap += "/";
 
-  // Folder containing pcap files
-  std::string pcap_folder = flag_dir + flag_src;
-
-  DIR* directory = opendir(pcap_folder.c_str());
+  DIR* directory = opendir(flag_pcap.c_str());
   if (!directory) {
-    std::cout << "Failed to open the directory: " << pcap_folder << std::endl;
+    std::cout << "Failed to open the directory: " << flag_pcap << std::endl;
     return 1;
   }
 
@@ -867,7 +692,7 @@ int MainPcap(int argc, char** argv) {
     char errbuff[PCAP_ERRBUF_SIZE];
     uint32_t pkt_count = 0;
 
-    std::string pcap_file_path = pcap_folder + pcap_file_name;
+    std::string pcap_file_path = flag_pcap + pcap_file_name;
     
     // Open file and create pcap handler
     pcap_t *const handler = pcap_open_offline(pcap_file_path.c_str(), errbuff);
@@ -923,7 +748,7 @@ int MainPcap(int argc, char** argv) {
       packet_offset += epb_len;
     }
 
-    LOG(INFO) << "Total " << pkt_count << " packets in " << pcap_file_name;  
+    LOG(INFO) << "Total " << pkt_count << " packets in\t\t" << pcap_file_name;  
     LOG_IF_ERROR(index->Flush2(), "index flush");
     delete index;
 
@@ -937,4 +762,4 @@ int MainPcap(int argc, char** argv) {
 
 } // namespace st
 
-int main(int argc, char** argv) { return st::MainPcap(argc, argv); }
+int main(int argc, char** argv) { return st::Main(argc, argv); }

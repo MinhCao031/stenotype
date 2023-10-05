@@ -440,11 +440,8 @@ void WriteToIndex(char first, const char* start, int size,
   memcpy(buf + 1, start, size);
 
   std::string bufhex = stringToHex((const unsigned char*)buf, 1+size);
-  int num_val = val.size();
+  // int num_val = val.size();
   // LOG(INFO) << bufhex << "\tNumVal = " << num_val << std::hex << "\tFrom " << val[0] << "\tto " << val[num_val-1];
-
-  // leveldb::Slice key(buf, size + 1);
-  // leveldb::Slice value = ValueFromVector(val);
   // LOG(INFO) << "Size of Key & values: " << key.size() << ",\t" << std::hex << value.size();
 
   ss->Add(leveldb::Slice(buf, size + 1), ValueFromVector(val));
@@ -498,8 +495,8 @@ Error Index::Flush2() {
 
   RETURN_IF_ERROR(WriteTo(file), "writing index " + filename);
 
-  LOG(INFO) << "Wrote all index files for " << filename;
-  LOG(INFO) << "Stored " << packets_ << " with " << ip4_.size() << " IP4, "
+  LOG(INFO) << "Wrote all index files to\t\t" << filename;
+  LOG(INFO) << "Stored " << packets_ << " packets with:\t\t" << ip4_.size() << " IP4, "
           << ip6_.size() << " IP6, " << proto_.size() << " protos, "
           << port_.size() << " ports, " << vlan_.size() << " vlan, "
           << mpls_.size() << " mpls\n";
