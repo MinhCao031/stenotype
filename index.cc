@@ -32,11 +32,13 @@
 #include <leveldb/table_builder.h>
 
 namespace leveldb {
+  
   // Augment leveldb::Slice just slightly, so we can use it inside ordered
   // data structures like our in-memory trees.
   bool operator<(const leveldb::Slice& a, const leveldb::Slice& b) {
     return a.compare(b) < 0;
   }
+
 }  // namespace leveldb
 
 namespace st {
@@ -486,7 +488,7 @@ Error Index::Flush() {
 
 Error Index::Flush2() {
   leveldb::WritableFile* file = NULL;
-  std::string filename = dirname_ + "IDX/" + std::to_string(micros_);
+  std::string filename = dirname_ + std::to_string(micros_);
   auto status = leveldb::Env::Default()->NewWritableFile(filename, &file);
   if (!status.ok()) {
     return ERROR("could not open '" + filename + "': " + status.ToString());
@@ -495,11 +497,11 @@ Error Index::Flush2() {
 
   RETURN_IF_ERROR(WriteTo(file), "writing index " + filename);
 
-  LOG(INFO) << "Wrote all index files to\t\t" << filename;
-  LOG(INFO) << "Stored " << packets_ << " packets with:\t\t" << ip4_.size() << " IP4, "
-          << ip6_.size() << " IP6, " << proto_.size() << " protos, "
-          << port_.size() << " ports, " << vlan_.size() << " vlan, "
-          << mpls_.size() << " mpls\n";
+  // LOG(INFO) << "Wrote all index files to\t\t" << filename;
+  // LOG(INFO) << "Got " << packets_ << " packets with:\t\t" << ip4_.size() << " IP4, "
+  //         << ip6_.size() << " IP6, " << proto_.size() << " protos, "
+  //         << port_.size() << " ports, " << vlan_.size() << " vlan, "
+  //         << mpls_.size() << " mpls\n";
   return SUCCESS;
 }
 
