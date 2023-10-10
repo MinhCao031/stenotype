@@ -77,176 +77,10 @@ const uint16_t kTypeEthernet = 0;
 const uint32_t kMPLSBottomOfStack = 1 << 8;
 
 void Index::Process(const Packet& p, int64_t block_offset) {
-  packets_++;
-  int64_t packet_offset = block_offset + p.offset_in_block;
-  CHECK(packet_offset < (int64_t(1) << 32));
-  const char* start = p.data.data();
-  const char* limit = start + p.data.size();
-  uint16_t type = kTypeEthernet;
-  uint8_t protocol = 0;
-  
-  uint64_t time_pkt1 = std::chrono::system_clock::now().time_since_epoch().count();
-  if (0) LOG(INFO) << time_pkt1 / 1000000000 << "." << time_pkt1 % 1000000000
-    << "\tP#" << packets_ << "\tOff=" << packet_offset << "\tD=" << p.data.size() // EXTRA
-    << "\tT=" << p.timestamp_nsecs << "\tL=" << p.length; // EXTRA
-
-// We use a goto loop within this switch statement to strip all pre-IP-header
-// layers off of the given packet.
-pre_ip_encapsulation:
-  // LOG(INFO) << "Try type = " << std::hex << type;
-  switch (type) {
-    case kTypeEthernet: {
-      if (start + sizeof(struct ethhdr) > limit) {
-        return;
-      }
-      auto eth = reinterpret_cast<const struct ethhdr*>(start);
-      start += sizeof(struct ethhdr);
-      type = ntohs(eth->h_proto);
-      goto pre_ip_encapsulation;
-    }
-    case ETH_P_8021Q:
-    case ETH_P_8021AD:
-    case ETH_P_QINQ1:
-    case ETH_P_QINQ2:
-    case ETH_P_QINQ3: {
-      if (start + 4 > limit) {
-        return;
-      }
-      AddVLAN(ntohs(*reinterpret_cast<const uint16_t*>(start)) & 0x0FFF,
-              packet_offset);
-      type = ntohs(*reinterpret_cast<const uint16_t*>(start + 2));
-      start += 4;
-      goto pre_ip_encapsulation;
-    }
-    case ETH_P_MPLS_UC:
-    case ETH_P_MPLS_MC: {
-      uint32_t mpls_header = 0;
-      do {
-        // We check for 5 bytes, because we need to parse the first nibble after
-        // the MPLS header to figure out the next layer type.
-        if (start + 5 > limit) {
-          return;
-        }
-        mpls_header = ntohl(*reinterpret_cast<const uint32_t*>(start));
-        AddMPLS(mpls_header >> 12, packet_offset);
-        start += 4;
-      } while (!(mpls_header & kMPLSBottomOfStack));
-      // Use the first nibble after the last MPLS layer to determine the
-      // underlying packet type.
-      switch (start[0] >> 4) {
-        case 0:  // RFC4385
-          type = kTypeEthernet;
-          start += 4;  // Skip over PW ethernet control word.
-          break;
-        case 4:
-          type = ETH_P_IP;
-          break;
-        case 6:
-          type = ETH_P_IPV6;
-          break;
-        default:
-          return;
-      }
-      goto pre_ip_encapsulation;
-    }
-
-    // All of the above use the pre_ip_encapsulation loop.
-    // All of the below do not.
-
-    case ETH_P_IP: {
-      if (start + sizeof(struct iphdr) > limit) {
-        return;
-      }
-      auto ip4 = reinterpret_cast<const struct iphdr*>(start);
-      // LOG(INFO) << (int)ip4->tos << "\t" << ip4->tot_len << "\t" << ip4->id << "\t"
-      //   << ip4->frag_off << "\t" << (int)ip4->ttl << "\t" << (int)ip4->protocol << "\t"
-      //   << ip4->check << "\t" << ip4->saddr << "\t" << ip4->daddr;
-
-      AddIPv4(ntohl(ip4->saddr), packet_offset);
-      AddIPv4(ntohl(ip4->daddr), packet_offset);
-      size_t len = ip4->ihl;
-      len *= 4;
-      if (len < 20) return;
-      protocol = ip4->protocol;
-      start += len;
-      break;
-    }
-    case ETH_P_IPV6: {
-      if (start + sizeof(struct ip6_hdr) > limit) {
-        return;
-      }
-      auto ip6 = reinterpret_cast<const struct ip6_hdr*>(start);
-      protocol = ip6->ip6_ctlun.ip6_un1.ip6_un1_nxt;
-      start += sizeof(struct ip6_hdr);
-      AddIPv6(leveldb::Slice(reinterpret_cast<const char*>(&ip6->ip6_src), 16),
-              packet_offset);
-      AddIPv6(leveldb::Slice(reinterpret_cast<const char*>(&ip6->ip6_dst), 16),
-              packet_offset);
-
-    // Here, we use another goto loop to strip off all IPv6 extensions.
-    ip6_extensions:
-      switch (protocol) {
-        case IPPROTO_FRAGMENT: {
-          if (start + sizeof(struct ip6_frag) > limit) {
-            return;
-          }
-          auto ip6frag = reinterpret_cast<const struct ip6_frag*>(start);
-          if (ntohs(ip6frag->ip6f_offlg) & 0xfff8) {
-            // If we're not the first fragment, break out of the loop so we
-            // can store the IPs we have but recognize in the protocol switch
-            // later on that we don't know what this packet is.
-            break;
-          }
-          // otherwise, fall through to treating this like any other
-          // extention.
-        }
-#ifdef IPPROTO_MH
-        case IPPROTO_MH:
-#endif
-        case IPPROTO_HOPOPTS:
-        case IPPROTO_ROUTING:
-        case IPPROTO_DSTOPTS: {
-          if (start + sizeof(struct ip6_ext) > limit) {
-            return;
-          }
-          auto ip6ext = reinterpret_cast<const struct ip6_ext*>(start);
-          protocol = ip6ext->ip6e_nxt;
-          start += (ip6ext->ip6e_len + 1) * 8;
-          goto ip6_extensions;
-        }
-      }
-      break;
-    }
-    default:
-      return;
-  }
-  // LOG(INFO) << "Adding protocol = " << (int)protocol; 
-  AddProtocol(protocol, packet_offset);
-  switch (protocol) {
-    case IPPROTO_TCP: {
-      if (start + sizeof(struct tcphdr) > limit) {
-        return;
-      }
-      auto tcp = reinterpret_cast<const struct tcphdr*>(start);
-      AddPort(ntohs(tcp->source), packet_offset);
-      AddPort(ntohs(tcp->dest), packet_offset);
-      break;
-    }
-    case IPPROTO_UDP: {
-      if (start + sizeof(struct udphdr) > limit) {
-        return;
-      }
-      auto udp = reinterpret_cast<const struct udphdr*>(start);
-      AddPort(ntohs(udp->source), packet_offset);
-      AddPort(ntohs(udp->dest), packet_offset);
-      break;
-    }
-    default:
-      return;
-  }
+  /* Replaced by ProcessRaw */
 }
 
-void Index::ProcessRaw(unsigned char* raw_pkt, int64_t packet_offset, uint32_t epb_len) {
+void Index::ProcessRaw(unsigned char* raw_pkt, int64_t packet_offset, uint64_t ts_microsec, uint32_t epb_len) {
   ++packets_;
   const unsigned char* start = (const unsigned char*)raw_pkt;
   const unsigned char* limit = start + epb_len;
@@ -269,6 +103,10 @@ pre_ip_encapsulation:
       }
       auto eth = reinterpret_cast<const struct ethhdr*>(start);
       start += sizeof(struct ethhdr);
+      AddMac(leveldb::Slice(reinterpret_cast<const char*>(&eth->h_dest), 6),
+              packet_offset);
+      AddMac(leveldb::Slice(reinterpret_cast<const char*>(&eth->h_source), 6),
+              packet_offset);
       type = ntohs(eth->h_proto);
       goto pre_ip_encapsulation;
     }
@@ -385,6 +223,7 @@ pre_ip_encapsulation:
       return;
   }
   AddProtocol(protocol, packet_offset);
+  AddTime(ts_microsec, packet_offset);
   switch (protocol) {
     case IPPROTO_TCP: {
       if (start + sizeof(struct tcphdr) > limit) {
@@ -442,9 +281,10 @@ void WriteToIndex(char first, const char* start, int size,
   memcpy(buf + 1, start, size);
 
   std::string bufhex = stringToHex((const unsigned char*)buf, 1+size);
-  // int num_val = val.size();
-  // LOG(INFO) << bufhex << "\tNumVal = " << num_val << std::hex << "\tFrom " << val[0] << "\tto " << val[num_val-1];
-  // LOG(INFO) << "Size of Key & values: " << key.size() << ",\t" << std::hex << value.size();
+  if (first != 2) {
+    int num_val = val.size();
+    LOG(INFO) << bufhex << "\tNumVal = " << num_val << std::hex << "\tFrom " << val[0] << "\tto " << val[num_val-1];
+  }
 
   ss->Add(leveldb::Slice(buf, size + 1), ValueFromVector(val));
 }
@@ -461,6 +301,7 @@ const char kIndexVLAN = 3;
 const char kIndexIPv4 = 4;
 const char kIndexMPLS = 5;
 const char kIndexIPv6 = 6;
+const char kIndexTs_6 = 7;
 
 }  // namespace
 
@@ -528,23 +369,32 @@ Error Index::WriteTo(leveldb::WritableFile* file) {
     }                                                                     \
   } while (0)
 
-  // LOG(INFO) << "List data for kIndexProtocol\n";
+  LOG(INFO) << "List data for kIndexProtocol\n";
   WRITE_TO_INDEX(proto, , kIndexProtocol, 1);
-  // LOG(INFO) << "List data for kIndexPort\n";
+  LOG(INFO) << "List data for kIndexPort\n";
   WRITE_TO_INDEX(port, htons, kIndexPort, 2);
-  // LOG(INFO) << "List data for kIndexVLAN\n";
+  LOG(INFO) << "List data for kIndexVLAN\n";
   WRITE_TO_INDEX(vlan, htons, kIndexVLAN, 2);
-  // LOG(INFO) << "List data for kIndexIPv4\n";
+  LOG(INFO) << "List data for kIndexIPv4\n";
   WRITE_TO_INDEX( ip4, htonl, kIndexIPv4, 4);
-  // LOG(INFO) << "List data for kIndexMPLS\n";
+  LOG(INFO) << "List data for kIndexMPLS\n";
   WRITE_TO_INDEX(mpls, htonl, kIndexMPLS, 4);
+  // LOG(INFO) << "List data for Tim\n";
+  // WRITE_TO_INDEX(ts_6, htonl, kIndexIPv4, 4);
+
 
 #undef WRITE_TO_INDEX
 
+  LOG(INFO) << "List data for kIndexIPv6\n";
   for (auto iter : ip6_) {
     auto ip6 = iter.first.data();
-    // LOG(INFO) << "List data for kIndexIPv6\n";
     WriteToIndex(kIndexIPv6, ip6, 16, iter.second, &index_ss);
+  }
+
+  LOG(INFO) << "List data for kIndexMac\n";
+  for (auto iter : mac_) {
+    auto mac = iter.first.data();
+    WriteToIndex(kIndexIPv6, mac, 6, iter.second, &index_ss);
   }
 
   auto finished = index_ss.Finish();
@@ -570,18 +420,28 @@ void Index::AddIPv6(leveldb::Slice ip, uint32_t pos) {
   }
 }
 
+void Index::AddMac(leveldb::Slice mac, uint32_t pos) {
+  CHECK(mac.size() == 6);
+  auto finder = mac_.find(mac);
+  if (finder == mac_.end()) {
+    mac = ip_pieces_.Store(mac);
+    mac_[mac].push_back(pos);
+  } else {
+    finder->second.push_back(pos);
+  }
+}
+
 #define ADD_TO_INDEX(name, pos)   \
   do {                            \
     name##_[name].push_back(pos); \
   } while (0)
 
-void Index::AddProtocol(uint8_t proto, uint32_t pos) {
-  ADD_TO_INDEX(proto, pos);
-}
+void Index::AddProtocol(uint8_t proto, uint32_t pos) {  ADD_TO_INDEX(proto, pos); }
 void Index::AddPort(uint16_t port, uint32_t pos) { ADD_TO_INDEX(port, pos); }
 void Index::AddVLAN(uint16_t vlan, uint32_t pos) { ADD_TO_INDEX(vlan, pos); }
 void Index::AddMPLS(uint32_t mpls, uint32_t pos) { ADD_TO_INDEX(mpls, pos); }
 void Index::AddIPv4(uint32_t ip4, uint32_t pos) { ADD_TO_INDEX(ip4, pos); }
+void Index::AddTime(uint64_t ts_6, uint32_t pos) { ADD_TO_INDEX(ts_6, pos); }
 
 #undef ADD_TO_INDEX
 

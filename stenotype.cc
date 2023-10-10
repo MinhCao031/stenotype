@@ -455,12 +455,13 @@ unsigned char* get_eph_block(struct pcap_pkthdr *header_pcap, unsigned char cons
   uint32_t pkt_clen = header_pcap->caplen;
   uint32_t pkt_leng = header_pcap->caplen;
   uint32_t blocklen = pkt_leng + EPB_HDRPAD_LEN;
-  
   uint16_t pad = blocklen & 3; // %4
   if (pad > 0) {
     pad = 4 - pad;
     blocklen += pad;
   }
+
+  // epb_len stores the length of Enhanced packet block in raw file
   *epb_len = blocklen;
 
   // Debug purpose
@@ -521,31 +522,30 @@ void RunThread(int thread, std::vector<std::string> files, uint32_t num_of_files
   
   // for (uint32_t fi = 0; fi < num_of_file && run_threads; fi++) {
   while (file_iter < num_of_files && run_threads) {
+    std::unique_lock<std::mutex> lock(file_iter_mutex);
 
     // Error buffer
     char errbuff[PCAP_ERRBUF_SIZE];
     uint32_t pkt_count = 0;
 
-    std::string pcap_file_name = files[file_iter];
+    std::string pcap_file_name = files[file_iter++];
     std::string pcap_file_path = flag_pcap + pcap_file_name;
     
     // Open file and create pcap handler
-    std::unique_lock<std::mutex> lock(file_iter_mutex);
     pcap_t *const pcap_handler = pcap_open_offline(pcap_file_path.c_str(), errbuff);
     CHECK(pcap_handler != NULL);
     LOG(INFO) << "Thread " << thread << ": Reading\t\t" << pcap_file_name;   
-    file_iter++;
     lock.unlock();
 
     // The header that pcap gives us
     struct pcap_pkthdr *header_pcap;
     // The actual packet
     unsigned char const* full_packet;
-    // This offset will eventually pointed at every enhanced packet block's start
+    // This offset will in turn pointed at every enhanced packet block's start
     // Increase by 28 (bytes) to go to their raw packet data instead
     uint64_t packet_offset = MIN_SHB_IDB_LEN; // maybe +28
 
-    // Index of index file
+    // Index of index file 
     Index* index = NULL;
     int64_t micros = GetCurrentTimeMicros();
     if (flag_index) {
@@ -567,6 +567,7 @@ void RunThread(int thread, std::vector<std::string> files, uint32_t num_of_files
     while (pcap_next_ex(pcap_handler, &header_pcap, &full_packet) >= 0) {
       uint32_t epb_len = EPB_HDRPAD_LEN;
       uint16_t pkt_len = header_pcap->caplen;
+      uint64_t pkt_time_microsec = header_pcap->ts.tv_sec * 1000000 + header_pcap->ts.tv_usec;
       unsigned char* epb_header = get_eph_block(header_pcap, full_packet, &epb_len);
       
       // Write the enhanced packet block to pcapng file
@@ -578,7 +579,7 @@ void RunThread(int thread, std::vector<std::string> files, uint32_t num_of_files
       file.write((const char*)(epb_header + 4), 4);  
 
       // Add packet's key to level-db
-      index->ProcessRaw((unsigned char*)full_packet, packet_offset, pkt_len);
+      index->ProcessRaw((unsigned char*)full_packet, packet_offset, pkt_time_microsec, pkt_len);
 
       pkt_count++; // LOG(INFO) << "Offset at packet #" << index->packets_ << " = " << packet_offset;    
       packet_offset += epb_len;

@@ -117,17 +117,19 @@ class Index {
   void Process(const Packet& p, int64_t block_offset);
   Error Flush();
 
-  void ProcessRaw(unsigned char* pkt, int64_t block_offset, uint32_t epb_len);
+  void ProcessRaw(unsigned char* raw_pkt, int64_t packet_offset, uint64_t ts_microsec, uint32_t epb_len);
   Error Flush2();
   Error WriteTo(leveldb::WritableFile* file);
 
  private:
   void AddIPv4(uint32_t ip, uint32_t pos);
   void AddIPv6(leveldb::Slice ip, uint32_t pos);
+  void AddMac(leveldb::Slice mac, uint32_t pos);
   void AddProtocol(uint8_t proto, uint32_t pos);
   void AddPort(uint16_t port, uint32_t pos);
   void AddVLAN(uint16_t port, uint32_t pos);
   void AddMPLS(uint32_t mpls, uint32_t pos);
+  void AddTime(uint64_t ts_6, uint32_t pos);
   //// Add key+value to index with new extra column here
 
   std::string dirname_;
@@ -136,10 +138,12 @@ class Index {
   SliceSet ip_pieces_;
   std::map<uint32_t, std::vector<uint32_t>> ip4_;
   std::map<leveldb::Slice, std::vector<uint32_t>> ip6_;
+  std::map<leveldb::Slice, std::vector<uint32_t>> mac_;
   std::map<uint8_t, std::vector<uint32_t>> proto_;
   std::map<uint16_t, std::vector<uint32_t>> port_;
   std::map<uint16_t, std::vector<uint32_t>> vlan_;
   std::map<uint32_t, std::vector<uint32_t>> mpls_;
+  std::map<uint64_t, std::vector<uint32_t>> ts_6_;
   //// Extra column can be added here
 
   DISALLOW_COPY_AND_ASSIGN(Index);
