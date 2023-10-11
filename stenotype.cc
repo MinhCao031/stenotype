@@ -90,8 +90,8 @@ namespace {
 
 std::string flag_iface = "eth0";
 std::string flag_filter = "";
-std::string flag_dir = "";
-std::string flag_pcap = "./log/Pcap";
+std::string flag_dir = "./log";
+std::string flag_pcap = "/tmp/stenographer/Pcap";
 int64_t flag_count = -1;
 int32_t flag_blocks = 2048;
 int32_t flag_aiops = 128;
@@ -511,16 +511,24 @@ void RunThread(int thread, std::vector<std::string> files, uint32_t num_of_files
 
   DropPacketThreadPrivileges();
   LOG(INFO) << "Thread " << thread << " starting to process";
+  std::cout << "Thread " << thread << " starting to process\n";
 
   // All dirnames are guaranteed to end with '/'.
   std::string pcapng_dirname = flag_dir + "PKT" + std::to_string(thread) + "/";
   std::string index_dirname = flag_dir + "IDX" + std::to_string(thread) + "/";
 
+  // std::cout << "Thread " << thread << " trying to open " << pcapng_dirname << " and " << index_dirname << "\n";
+
+  // if (!OpenOrCreateFolder(pcapng_dirname)) {std::cout << "PKT failed\n"; return;}
+  // if (!OpenOrCreateFolder(index_dirname)) {std::cout << "IDX failed\n"; return;}
   CHECK(OpenOrCreateFolder(pcapng_dirname));
   CHECK(OpenOrCreateFolder(index_dirname));
+
+  // std::cout << "Thread " << thread << " starting to read\n";
   
   // for (uint32_t fi = 0; fi < num_of_file && run_threads; fi++) {
   while (file_iter < num_of_files && run_threads) {
+    std::unique_lock<std::mutex> lock(file_iter_mutex);
 
     // Error buffer
     char errbuff[PCAP_ERRBUF_SIZE];
@@ -530,10 +538,10 @@ void RunThread(int thread, std::vector<std::string> files, uint32_t num_of_files
     std::string pcap_file_path = flag_pcap + pcap_file_name;
     
     // Open file and create pcap handler
-    std::unique_lock<std::mutex> lock(file_iter_mutex);
     pcap_t *const pcap_handler = pcap_open_offline(pcap_file_path.c_str(), errbuff);
     CHECK(pcap_handler != NULL);
     LOG(INFO) << "Thread " << thread << ": Reading\t\t" << pcap_file_name;   
+    std::cout << "Thread " << thread << ": Reading\t\t" << pcap_file_name << "\n";   
     file_iter++;
     lock.unlock();
 
@@ -557,11 +565,13 @@ void RunThread(int thread, std::vector<std::string> files, uint32_t num_of_files
     std::string pcapng_file_path = pcapng_dirname + std::to_string(micros);
     std::ofstream file(pcapng_file_path);  
     if (!file.is_open()) {
-      std::cout << "Error: Unable to open the pcapng file: " << pcapng_file_path << std::endl;
+      LOG(INFO) << "Error: Unable to open the pcapng file: " << pcapng_file_path;
     } else {
       // Section Header Block & Interface Description Block
       file.write((const char*)pcapng_header, MIN_SHB_IDB_LEN);  
     }
+
+    LOG(INFO) << pcapng_file_path << ": 48-byte header written";
 
     // Looping through each packet
     while (pcap_next_ex(pcap_handler, &header_pcap, &full_packet) >= 0) {
@@ -580,7 +590,9 @@ void RunThread(int thread, std::vector<std::string> files, uint32_t num_of_files
       // Add packet's key to level-db
       index->ProcessRaw((unsigned char*)full_packet, packet_offset, pkt_len);
 
-      pkt_count++; // LOG(INFO) << "Offset at packet #" << index->packets_ << " = " << packet_offset;    
+      pkt_count++; 
+      // if (pkt_count % 1000000 == 0)
+      //   std::cout << "Offset at packet #" << ++pkt_count << " = " << packet_offset << "\n";    
       packet_offset += epb_len;
     }
     LOG(INFO) << "Thread " << thread << ": Done reading\t\t" << pcap_file_name;  
@@ -595,13 +607,12 @@ void RunThread(int thread, std::vector<std::string> files, uint32_t num_of_files
   }
 
   LOG(INFO) << "Finished thread " << thread << " successfully";
+  std::cout << "Finished thread " << thread << " successfully";
 }
 
 
 int Main(int argc, char** argv) {
   LOG_IF_ERROR(Errno(prctl(PR_SET_PDEATHSIG, SIGTERM)), "prctl PDEATHSIG");
-
-  // Parameters
   ParseOptions(argc, argv);
   LOG(INFO) << "Stenotype running with these arguments:";
   for (int i = 0; i < argc; i++) {
@@ -614,12 +625,15 @@ int Main(int argc, char** argv) {
   CHECK(flag_dir != "");
   CHECK(flag_pcap != "");
 
-  if (flag_threads > num_threads)
+  if (flag_threads > num_threads) {
     flag_threads = num_threads;
-  if (flag_dir[flag_dir.size() - 1] != '/')
+  }
+  if (flag_dir[flag_dir.size() - 1] != '/') {
     flag_dir += "/";
-  if (flag_pcap[flag_pcap.size() - 1] != '/')
+  }
+  if (flag_pcap[flag_pcap.size() - 1] != '/') {
     flag_pcap += "/";
+  }
   LOG(INFO) << "Threads used: " << flag_threads;
 
   // To be safe, also set umask before any threads are created.
@@ -638,7 +652,6 @@ int Main(int argc, char** argv) {
   sigaddset(&sigset, SIGTERM);
   CHECK_SUCCESS(Errno(pthread_sigmask(SIG_BLOCK, &sigset, NULL)));
 
-  
   DIR* directory = opendir(flag_pcap.c_str());
   if (!directory) {
     std::cout << "Failed to open the directory: " << flag_pcap << std::endl;
@@ -664,8 +677,8 @@ int Main(int argc, char** argv) {
   }
   closedir(directory);
 
-  std::cout << "----- START READING -----\n";
-  LOG(INFO) << "----- START READING -----";
+  // std::cout << "-1---- START READING ----4-\n";
+  LOG(INFO) << "-2---- START READING ----3-";
   std::vector<std::thread*> index_threads;
 
   // uint32_t startIndex = 0;
@@ -682,12 +695,11 @@ int Main(int argc, char** argv) {
     for (int i = 0; i < flag_threads; i++) {
       CHECK(index_threads[i]->joinable());
       index_threads[i]->join();
-      delete index_threads[i];
       VLOG(1) << "Index thread finished";
+      delete index_threads[i];
     }
   }
   LOG(INFO) << "------ END READING ------";
-  std::cout << "------ END READING ------\n";
   main_complete.Notify();
   return 0;
 }
