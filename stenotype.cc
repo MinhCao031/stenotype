@@ -90,8 +90,8 @@ namespace {
 
 std::string flag_iface = "eth0";
 std::string flag_filter = "";
-std::string flag_dir = "./log";
-std::string flag_pcap = "/tmp/stenographer/Pcap";
+std::string flag_dir = ""; // "/tmp/out"; //
+std::string flag_pcap = "/tmp/in"; // ""; //
 int64_t flag_count = -1;
 int32_t flag_blocks = 2048;
 int32_t flag_aiops = 128;
@@ -206,23 +206,6 @@ void ParseOptions(int argc, char** argv) {
 }  // namespace
 
 namespace st {
-
-#define MIN_SHB_IDB_LEN 48
-#define EPB_HEADER_LEN 28
-#define EPB_HDRPAD_LEN 32
-
-const unsigned char pcapng_header[] = {
-    0x0A, 0x0D, 0x0D, 0x0A, 0x1C, 0x00, 0x00, 0x00,
-    0x4D, 0x3C, 0x2B, 0x1A, 0x01, 0x00, 0x00, 0x00,
-    0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF,
-    0x1C, 0x00, 0x00, 0x00,
-    0x01, 0x00, 0x00, 0x00, 0x14, 0x00, 0x00, 0x00,
-    0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x04, 0x00,
-    0x14, 0x00, 0x00, 0x00
-};
-const unsigned char padding[] = {
-    0x00, 0x00, 0x00, 0x00
-};
 
 std::mutex file_iter_mutex;
 uint32_t file_iter = 0;
@@ -451,6 +434,76 @@ bool isFilePcap(std::string s) {
   return true;
 }
 
+#define MIN_SHB_IDB_LEN 48
+#define EPB_HEADER_LEN 28
+#define EPB_HDRPAD_LEN 32
+
+const unsigned char pcapng_header[] = {
+  0x0A, 0x0D, 0x0D, 0x0A, // (FIXED) Section Header Block 
+  0x1C, 0x00, 0x00, 0x00, // (FIXED) Length of SHB
+  0x4D, 0x3C, 0x2B, 0x1A, // Byte-Order Magic
+  0x01, 0x00, 0x00, 0x00, // Major Version + Minor Version
+  0xFF, 0xFF, 0xFF, 0xFF,
+  0xFF, 0xFF, 0xFF, 0xFF, // Section Length, usually unknown (-1)
+  0x1C, 0x00, 0x00, 0x00, // (FIXED) Length of SHB
+
+  0x01, 0x00, 0x00, 0x00, // (FIXED) Interface Description Block
+  0x14, 0x00, 0x00, 0x00, // (FIXED) Length of IDB
+  0x01, 0x00, 0x00, 0x00, // Link layer type (first 2 bytes only)
+  0x00, 0x00, 0x04, 0x00, // Snap length
+  0x14, 0x00, 0x00, 0x00  // (FIXED) Length of IDB
+};
+
+const unsigned char padding[] = {
+  0x00, 0x00, 0x00, 0x00
+};
+
+// Contain 1 SHB and 1 IDB
+unsigned char* get_pcapng_header(pcap_t* pcap_handler) {
+  // These default values may be changed depend on pcap file
+  uint32_t byte_ord = 0x1A2B3C4D; // Default LITTLE_ENDIAN
+  uint32_t versions = 1;          // Default 1.0 (0x___0___1)
+  uint64_t sctn_len = -1ull;      // Default 0xffffffffffffffff
+
+  uint32_t link_typ = pcap_datalink(pcap_handler);
+  uint32_t snap_len = pcap_snapshot(pcap_handler);
+
+  unsigned char* shid_block = new unsigned char[MIN_SHB_IDB_LEN];
+  memcpy(shid_block, pcapng_header, MIN_SHB_IDB_LEN);
+
+  /* Bytes map of pcapng section header block
+   *    0x0A0D0D0A  Block Type              (4 bytes)  0-3
+   *    usually 28  Block Total Length      (4 bytes)  4-7
+   *    ?-endian    Byte-Order Magic        (4 bytes)  8-11
+   *    usually  1  Major Version           (2 bytes) 12-13
+   *    usually  0  Minor Version           (2 bytes) 14-15
+   *    usually -1  Section Length          (8 bytes) 16-23
+   *    usually 28  Block Total Length      (redundant 4-byte value)
+   */
+  if (byte_ord != 0x1A2B3C4D)
+    memcpy(shid_block +  8, &byte_ord, 4);
+  if (versions != 1)
+    memcpy(shid_block + 12, &versions, 4);
+  if (sctn_len != -1ull)
+    memcpy(shid_block + 16, &sctn_len, 8); 
+
+  /* Bytes map of simple interface description block (offset 28)
+   *    0x0A0D0D0A  Block Type          (4 bytes)  0-3
+   *    usually 20  Block Total Length  (4 bytes)  4-7
+   *    link_typ    Link Layer Type     (2 bytes)  8-9
+   *    must be  0  Reserved            (2 bytes) 10-11
+   *    snap_len    SnapLen             (4 bytes) 12-15
+   *    usually 20  Block Total Length  (redundant 4-byte value)
+   */
+  if (link_typ != 1)
+    memcpy(shid_block + 36, &link_typ, 4);
+  if (snap_len != 0x00040000)
+    memcpy(shid_block + 40, &snap_len, 4);
+
+  return shid_block;
+}
+
+// Contain 1 packet raw data as option value 
 unsigned char* get_eph_block(struct pcap_pkthdr *header_pcap, unsigned char const* full_packet, uint32_t* epb_len) {
   uint32_t pkt_clen = header_pcap->caplen;
   uint32_t pkt_leng = header_pcap->caplen;
@@ -511,7 +564,7 @@ void RunThread(int thread, std::vector<std::string> files, uint32_t num_of_files
 
   DropPacketThreadPrivileges();
   LOG(INFO) << "Thread " << thread << " starting to process";
-  std::cout << "Thread " << thread << " starting to process\n";
+  // std::cout << "Thread " << thread << " starting to process\n";
 
   // All dirnames are guaranteed to end with '/'.
   std::string pcapng_dirname = flag_dir + "PKT" + std::to_string(thread) + "/";
@@ -519,8 +572,6 @@ void RunThread(int thread, std::vector<std::string> files, uint32_t num_of_files
 
   // std::cout << "Thread " << thread << " trying to open " << pcapng_dirname << " and " << index_dirname << "\n";
 
-  // if (!OpenOrCreateFolder(pcapng_dirname)) {std::cout << "PKT failed\n"; return;}
-  // if (!OpenOrCreateFolder(index_dirname)) {std::cout << "IDX failed\n"; return;}
   CHECK(OpenOrCreateFolder(pcapng_dirname));
   CHECK(OpenOrCreateFolder(index_dirname));
 
@@ -541,7 +592,7 @@ void RunThread(int thread, std::vector<std::string> files, uint32_t num_of_files
     pcap_t *const pcap_handler = pcap_open_offline(pcap_file_path.c_str(), errbuff);
     CHECK(pcap_handler != NULL);
     LOG(INFO) << "Thread " << thread << ": Reading\t\t" << pcap_file_name;   
-    std::cout << "Thread " << thread << ": Reading\t\t" << pcap_file_name << "\n";   
+    // std::cout << "Thread " << thread << ": Reading\t\t" << pcap_file_name << "\n";   
     file_iter++;
     lock.unlock();
 
@@ -568,10 +619,11 @@ void RunThread(int thread, std::vector<std::string> files, uint32_t num_of_files
       LOG(INFO) << "Error: Unable to open the pcapng file: " << pcapng_file_path;
     } else {
       // Section Header Block & Interface Description Block
-      file.write((const char*)pcapng_header, MIN_SHB_IDB_LEN);  
+      unsigned char* new_pcapng_header = get_pcapng_header(pcap_handler);
+      file.write((const char*)new_pcapng_header, MIN_SHB_IDB_LEN);  
     }
 
-    LOG(INFO) << pcapng_file_path << ": 48-byte header written";
+    // LOG(INFO) << pcapng_file_path << ": 48-byte header written";
 
     // Looping through each packet
     while (pcap_next_ex(pcap_handler, &header_pcap, &full_packet) >= 0) {
@@ -595,7 +647,8 @@ void RunThread(int thread, std::vector<std::string> files, uint32_t num_of_files
       //   std::cout << "Offset at packet #" << ++pkt_count << " = " << packet_offset << "\n";    
       packet_offset += epb_len;
     }
-    LOG(INFO) << "Thread " << thread << ": Done reading\t\t" << pcap_file_name;  
+
+    LOG(INFO) << "Thread " << thread << ": Done reading\t" << pcap_file_name;  
     LOG_IF_ERROR(index->Flush2(), "index flush");
     delete index;
 
@@ -607,7 +660,7 @@ void RunThread(int thread, std::vector<std::string> files, uint32_t num_of_files
   }
 
   LOG(INFO) << "Finished thread " << thread << " successfully";
-  std::cout << "Finished thread " << thread << " successfully";
+  // std::cout << "Finished thread " << thread << " successfully";
 }
 
 
@@ -700,11 +753,10 @@ int Main(int argc, char** argv) {
     }
   }
   LOG(INFO) << "------ END READING ------";
-  main_complete.Notify();
+  // main_complete.Notify();
   return 0;
 }
 
 } // namespace st
 
 int main(int argc, char** argv) { return st::Main(argc, argv); }
-
