@@ -39,7 +39,7 @@ OPT_LDFLAGS=$(OPT_LDFLAGS_SEC)
 DBG_CFLAGS=-g -fno-omit-frame-pointer -O1 -fno-optimize-sibling-calls
 DBG_LDFLAGS=
 
-FILES=util packets index aio stenotype
+FILES=util packets pcapng_blocks index aio stenotype 
 
 AFL=afl-g++
 FUZZ_FILES=util index index_bin

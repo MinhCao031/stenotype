@@ -1,8 +1,20 @@
 # stenotype
 This is Google stenographer's Stenotype that can export to pcapng and its index
 
+Instead of listening for packet, this reads pcap files and export their pcapng version and its index file
+
+Libraries needed:
+  - g++
+  - libaio-dev
+  - libcap2-bin
+  - libleveldb-dev
+  - libseccomp-dev
+  - libsnappy-dev
+
+How to compile: `make all`
+
 How to run:
-- Command to run: `sudo ./stenotype -v --dir=PATH/TO/OUTPUT/ --dir_pcap=PATH/TO/PCAP/`
+- Command to run: `sudo ./stenotype -v --gid=GID --uid=UID --dir=PATH/TO/OUTPUT/ --dir_pcap=PATH/TO/PCAP/ --thread=THREADS`
   - Need help? Run `sudo ./stenotype --help`
 - Example: `sudo ./stenotype -v --gid=root --uid=root --thread=2 --dir=./log/ --dir_pcap=/`
   - This will run using 2 threads

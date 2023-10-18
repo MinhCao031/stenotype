@@ -85,6 +85,7 @@
 #include "index.h"
 #include "packets.h"
 #include "util.h"
+#include "pcapng_blocks.h"
 
 namespace {
 
@@ -409,151 +410,9 @@ void HandleSignalsThread() {
   VLOG(1) << "Signal handling done";
 }
 
-bool OpenOrCreateFolder(const std::string& folderPath) {
-  DIR* dir = opendir(folderPath.c_str());
-
-  if (dir) {
-    // Folder already exists
-    closedir(dir);
-    return true;
-  }
-
-  // Folder does not exist, create a new one
-  int status = mkdir(folderPath.c_str(), S_IRWXU | S_IRWXG | S_IROTH | S_IXOTH);
-  return status == 0;
-}
-
-bool isFilePcap(std::string s) {
-  int n = s.length();
-  if (n < 5) return false;
-  if (s[n-5] != '.') return false;
-  if (s[n-4] != 'p') return false;
-  if (s[n-3] != 'c') return false;
-  if (s[n-2] != 'a') return false;
-  if (s[n-1] != 'p') return false;
-  return true;
-}
-
-#define MIN_SHB_IDB_LEN 48
-#define EPB_HEADER_LEN 28
-#define EPB_HDRPAD_LEN 32
-
-const unsigned char pcapng_header[] = {
-  0x0A, 0x0D, 0x0D, 0x0A, // (FIXED) Section Header Block 
-  0x1C, 0x00, 0x00, 0x00, // (FIXED) Length of SHB
-  0x4D, 0x3C, 0x2B, 0x1A, // Byte-Order Magic
-  0x01, 0x00, 0x00, 0x00, // Major Version + Minor Version
-  0xFF, 0xFF, 0xFF, 0xFF,
-  0xFF, 0xFF, 0xFF, 0xFF, // Section Length, usually unknown (-1)
-  0x1C, 0x00, 0x00, 0x00, // (FIXED) Length of SHB
-
-  0x01, 0x00, 0x00, 0x00, // (FIXED) Interface Description Block
-  0x14, 0x00, 0x00, 0x00, // (FIXED) Length of IDB
-  0x01, 0x00, 0x00, 0x00, // Link layer type (first 2 bytes only)
-  0x00, 0x00, 0x04, 0x00, // Snap length
-  0x14, 0x00, 0x00, 0x00  // (FIXED) Length of IDB
-};
-
 const unsigned char padding[] = {
   0x00, 0x00, 0x00, 0x00
 };
-
-// Contain 1 SHB and 1 IDB
-unsigned char* get_pcapng_header(pcap_t* pcap_handler) {
-  // These default values may be changed depend on pcap file
-  uint32_t byte_ord = 0x1A2B3C4D; // Default LITTLE_ENDIAN
-  uint32_t versions = 1;          // Default 1.0 (0x___0___1)
-  uint64_t sctn_len = -1ull;      // Default 0xffffffffffffffff
-
-  uint32_t link_typ = pcap_datalink(pcap_handler);
-  uint32_t snap_len = pcap_snapshot(pcap_handler);
-
-  unsigned char* shid_block = new unsigned char[MIN_SHB_IDB_LEN];
-  memcpy(shid_block, pcapng_header, MIN_SHB_IDB_LEN);
-
-  /* Bytes map of pcapng section header block
-   *    0x0A0D0D0A  Block Type              (4 bytes)  0-3
-   *    usually 28  Block Total Length      (4 bytes)  4-7
-   *    ?-endian    Byte-Order Magic        (4 bytes)  8-11
-   *    usually  1  Major Version           (2 bytes) 12-13
-   *    usually  0  Minor Version           (2 bytes) 14-15
-   *    usually -1  Section Length          (8 bytes) 16-23
-   *    usually 28  Block Total Length      (redundant 4-byte value)
-   */
-  if (byte_ord != 0x1A2B3C4D)
-    memcpy(shid_block +  8, &byte_ord, 4);
-  if (versions != 1)
-    memcpy(shid_block + 12, &versions, 4);
-  if (sctn_len != -1ull)
-    memcpy(shid_block + 16, &sctn_len, 8); 
-
-  /* Bytes map of simple interface description block (offset 28)
-   *    0x0A0D0D0A  Block Type          (4 bytes)  0-3
-   *    usually 20  Block Total Length  (4 bytes)  4-7
-   *    link_typ    Link Layer Type     (2 bytes)  8-9
-   *    must be  0  Reserved            (2 bytes) 10-11
-   *    snap_len    SnapLen             (4 bytes) 12-15
-   *    usually 20  Block Total Length  (redundant 4-byte value)
-   */
-  if (link_typ != 1)
-    memcpy(shid_block + 36, &link_typ, 4);
-  if (snap_len != 0x00040000)
-    memcpy(shid_block + 40, &snap_len, 4);
-
-  return shid_block;
-}
-
-// Contain 1 packet raw data as option value 
-unsigned char* get_eph_block(struct pcap_pkthdr *header_pcap, unsigned char const* full_packet, uint32_t* epb_len) {
-  uint32_t pkt_clen = header_pcap->caplen;
-  uint32_t pkt_leng = header_pcap->caplen;
-  uint32_t blocklen = pkt_leng + EPB_HDRPAD_LEN;
-  
-  uint16_t pad = blocklen & 3; // %4
-  if (pad > 0) {
-    pad = 4 - pad;
-    blocklen += pad;
-  }
-  *epb_len = blocklen;
-
-  // Debug purpose
-  if (pkt_clen != pkt_leng)
-    std::cout << "Different length??? " << pkt_clen << " != " << pkt_leng << "\n";
-
-  // Enhanced packet block's blocktype
-  uint32_t blk_type = 6;
-  // Pcap file assumes all packets are in the same interface
-  uint32_t iface_id = 0;  
-
-  // UTC timestamp in microsec (pcap only support micro-sec and not nano-sec)
-  uint64_t ts_micro = header_pcap->ts.tv_sec * 1000000 + header_pcap->ts.tv_usec * 1;
-  uint32_t ts_upper = ts_micro >> 32;
-  uint32_t ts_lower = ts_micro & ((1ll << 32) - 1);
-    
-  /* Bytes map of pcapng enhanced packet block
-   *    usually 6   Block Type              (4 bytes) 0-3
-   *    block_len   Block Total Length (1)  (4 bytes) 4-7
-   *    usually 0   Interface ID            (4 bytes) 8-11
-   *    ts << 32    Timestamp Upper         (4 bytes) 12-15
-   *    ts % 2^32   Timestamp Lower         (4 bytes) 16-19
-   *    hdr.caplen  Captured Packet Length  (4 bytes) 20-23
-   *    hdr.len     Original Packet Length  (4 bytes) 24-27
-   *    raw_data    Packet Data             (l bytes) 28-x
-   *    padding     Padding to 4 bytes      (0-3 bytes)
-   *    caplen+32   Block Total Length (2)  (redundant 4-byte value)
-   * Values of (1) & (2) should be the same
-   */
-  unsigned char* ep_block = new unsigned char[29];
-  memcpy(ep_block +  0, &blk_type, 4);
-  memcpy(ep_block +  4, &blocklen, 4);
-  memcpy(ep_block +  8, &iface_id, 4); 
-  memcpy(ep_block + 12, &ts_upper, 4);
-  memcpy(ep_block + 16, &ts_lower, 4);
-  memcpy(ep_block + 20, &pkt_clen, 4);
-  memcpy(ep_block + 24, &pkt_leng, 4);
-
-  return ep_block;
-}
 
 void RunThread(int thread, std::vector<std::string> files, uint32_t num_of_files) {
   if (flag_threads > 1) {
@@ -602,7 +461,7 @@ void RunThread(int thread, std::vector<std::string> files, uint32_t num_of_files
     unsigned char const* full_packet;
     // This offset will eventually pointed at every enhanced packet block's start
     // Increase by 28 (bytes) to go to their raw packet data instead
-    uint64_t packet_offset = MIN_SHB_IDB_LEN; // maybe +28
+    uint64_t packet_offset = MIN_SHB_IDB_LEN + 82-28; // maybe +28
 
     // Index of index file
     Index* index = NULL;
@@ -619,33 +478,31 @@ void RunThread(int thread, std::vector<std::string> files, uint32_t num_of_files
       LOG(INFO) << "Error: Unable to open the pcapng file: " << pcapng_file_path;
     } else {
       // Section Header Block & Interface Description Block
-      unsigned char* new_pcapng_header = get_pcapng_header(pcap_handler);
-      file.write((const char*)new_pcapng_header, MIN_SHB_IDB_LEN);  
+      SectionHdrBlock shb = SectionHdrBlock();
+      file.write((const char*)&shb, MIN_SHB_LEN);
+      IfaceDescBlock idb = IfaceDescBlock(pcap_handler);
+      file.write((const char*)&idb, MIN_IDB_LEN);
     }
-
-    // LOG(INFO) << pcapng_file_path << ": 48-byte header written";
 
     // Looping through each packet
     while (pcap_next_ex(pcap_handler, &header_pcap, &full_packet) >= 0) {
-      uint32_t epb_len = EPB_HDRPAD_LEN;
-      uint16_t pkt_len = header_pcap->caplen;
-      unsigned char* epb_header = get_eph_block(header_pcap, full_packet, &epb_len);
-      
+      EnhancedPktBlock epb = EnhancedPktBlock(header_pcap, full_packet);
+
       // Write the enhanced packet block to pcapng file
-      file.write((const char*)epb_header, EPB_HEADER_LEN);  
-      file.write((const char*)full_packet, pkt_len);
-      if (pkt_len & 3) {
-        file.write((const char*)padding, 4 - (pkt_len & 3));  
+      file.write((const char*)&epb, EPB_HEADER_LEN);  
+      file.write((const char*)full_packet, epb.get_cap_leng());
+      if (epb.get_num_pads() > 0) {
+        file.write((const char*)padding, epb.get_num_pads());  
       }
-      file.write((const char*)(epb_header + 4), 4);  
+      file.write((const char*)epb.getptr_blocklen(), 4);  
 
       // Add packet's key to level-db
-      index->ProcessRaw((unsigned char*)full_packet, packet_offset, pkt_len);
+      index->ProcessRaw((unsigned char*)full_packet, packet_offset, epb.get_cap_leng());
 
       pkt_count++; 
       // if (pkt_count % 1000000 == 0)
       //   std::cout << "Offset at packet #" << ++pkt_count << " = " << packet_offset << "\n";    
-      packet_offset += epb_len;
+      packet_offset += epb.get_blocklen();
     }
 
     LOG(INFO) << "Thread " << thread << ": Done reading\t" << pcap_file_name;  
@@ -660,9 +517,7 @@ void RunThread(int thread, std::vector<std::string> files, uint32_t num_of_files
   }
 
   LOG(INFO) << "Finished thread " << thread << " successfully";
-  // std::cout << "Finished thread " << thread << " successfully";
 }
-
 
 int Main(int argc, char** argv) {
   LOG_IF_ERROR(Errno(prctl(PR_SET_PDEATHSIG, SIGTERM)), "prctl PDEATHSIG");
@@ -673,7 +528,7 @@ int Main(int argc, char** argv) {
   }
 
   uint16_t num_threads = std::thread::hardware_concurrency();
-  LOG(INFO) << "Max threads: " << num_threads;
+  LOG(INFO) << "Max threads possible: " << num_threads;
   CHECK(flag_threads >= 1);
   CHECK(flag_dir != "");
   CHECK(flag_pcap != "");
@@ -698,7 +553,7 @@ int Main(int argc, char** argv) {
   std::thread signal_thread(&HandleSignalsThread);
   signal_thread.detach();
   // ... Then, we block those signals from being handled by this thread or any
-  // of its children.  All other threads MUST be created after this.
+  // of its children. All other threads MUST be created after this.
   sigset_t sigset;
   sigemptyset(&sigset);
   sigaddset(&sigset, SIGINT);
@@ -711,7 +566,7 @@ int Main(int argc, char** argv) {
     return 1;
   }
 
-  LOG(INFO) << "----- START SCANNING -----";
+  LOG(INFO) << "---*--- START SCANNING ---*---";
   std::vector<std::string> pcap_files;
   uint32_t num_of_pcaps = 0;
 
@@ -730,8 +585,7 @@ int Main(int argc, char** argv) {
   }
   closedir(directory);
 
-  // std::cout << "-1---- START READING ----4-\n";
-  LOG(INFO) << "-2---- START READING ----3-";
+  LOG(INFO) << "---*--- START READING ---*---";
   std::vector<std::thread*> index_threads;
 
   // uint32_t startIndex = 0;
@@ -752,8 +606,10 @@ int Main(int argc, char** argv) {
       delete index_threads[i];
     }
   }
-  LOG(INFO) << "------ END READING ------";
-  // main_complete.Notify();
+  LOG(INFO) << "---*--- END READING ---*---";
+
+  // Stop
+  main_complete.Notify();
   return 0;
 }
 
