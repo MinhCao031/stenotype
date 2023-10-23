@@ -26,7 +26,7 @@ ifneq (,$(wildcard /usr/bin/c++))
 CXX=/usr/bin/c++
 endif
 SHARED_CFLAGS=-std=c++0x -Wall -fno-strict-aliasing $(DEFINES)
-SHARED_LDFLAGS=-lleveldb -lrt -laio -lpthread -lsnappy -lseccomp -lpcap
+SHARED_LDFLAGS=-lleveldb -lrt -laio -lpthread -lsnappy -lseccomp -lpcap -lpacket_shm
 ifneq (,$(wildcard /usr/include/testimony.h))
 SHARED_LDFLAGS += -ltestimony
 endif
@@ -39,7 +39,7 @@ OPT_LDFLAGS=$(OPT_LDFLAGS_SEC)
 DBG_CFLAGS=-g -fno-omit-frame-pointer -O1 -fno-optimize-sibling-calls
 DBG_LDFLAGS=
 
-FILES=util packets pcapng_blocks index aio stenotype 
+FILES=util packets index aio stenotype pcapng_blocks
 
 AFL=afl-g++
 FUZZ_FILES=util index index_bin

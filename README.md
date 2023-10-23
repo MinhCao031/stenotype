@@ -14,20 +14,21 @@ Libraries needed:
 How to compile: `make all`
 
 How to run:
-- Command to run: `sudo ./stenotype -v --gid=GID --uid=UID --dir=PATH/TO/OUTPUT/ --dir_pcap=PATH/TO/PCAP/ --thread=THREADS`
-  - Need help? Run `sudo ./stenotype --help`
-- Example: `sudo ./stenotype -v --gid=root --uid=root --thread=2 --dir=./log/ --dir_pcap=/`
-  - This will run using 2 threads
-  - This will find and read all pcap files from `./`
-  - For each pcap file, it then export them as pcapng in `./log/PKT/`
-  - For each pcapng exported into `./log/PKT/`, its index file is also created in `./log/IDX/`
+- Need help? Run `./stenotype --help`
+- Command to run:
+```bash
+`sudo ./stenotype -v --gid=GID --uid=UID --filesize_mb=SIZE --fileage_sec=SEC \
+  --thread=THREADS --dir=PATH/TO/OUTPUT/ --dir_pcap=PATH/TO/PCAP/ `
+```
+- Example:
+```bash
+`sudo ./stenotype -v --gid=root --uid=root --filesize_mb=512 --fileage_sec=30 \
+  --thread=4 --dir=/tmp/out --dir_pcap=/tmp/in`
+```
+  - This will run using 4 threads, with `-v` means verbose output
+  - The threads will find and read all pcap files from `/tmp/in`, they also wait for new pcap after that
+  - This will stop if there're no new files in a short time (in this case 3*30sec = 90sec)
+  - For each pcap file, it then export its pcapng version in `./tmp/out/PKTj`. (j = 0,1,2,... is thread ID)
+  - Each pcapng size is no more than 512MB. If the pcap is too big, its packets will be divided into many pcapng files.
+  - For each pcapng exported into `./tmp/out/PKTj`, its index file with the same name is also created in `./tmp/out/IDXj`
   - All mentioned folders are opened with root's permission
-
-Note:
-- The file `read_byte` file is used to read byte from a file (compiled from `read_byte.cc`)
-- This can be run using these paramters (mentioned as flags in source code):
-  - `dir`: Directory of input and output files. This must contain 2 folder: `PKT/` and `IDX/`
-  - `dir_pcap`: Directory of pcap files
-  - `thread`: Number of threads running in the same time
-  - `gid`, `uid`
-  - `-v`: Verbose

@@ -76,6 +76,11 @@
 #include <string>
 #include <sstream>
 #include <thread>
+#include <condition_variable>
+#include <sys/inotify.h>
+#include <unistd.h>
+#include <vector>
+#include <queue>
 
 // Due to some weird interactions with <argp.h>, <string>, and --std=c++0x, this
 // header MUST be included AFTER <string>.
@@ -86,6 +91,7 @@
 #include "packets.h"
 #include "util.h"
 #include "pcapng_blocks.h"
+#include "packet_shm.h"
 
 namespace {
 
@@ -209,7 +215,10 @@ void ParseOptions(int argc, char** argv) {
 namespace st {
 
 std::mutex file_iter_mutex;
-uint32_t file_iter = 0;
+std::mutex file_seeker_mutex;
+std::mutex file_fetcher;
+std::queue<std::string> fileQueue;
+std::condition_variable conditionVar;
 
 // These two synchronization mechanisms are used to coordinate when to
 // chroot/chuid so it's after when the threads create their sockets but before
@@ -410,113 +419,216 @@ void HandleSignalsThread() {
   VLOG(1) << "Signal handling done";
 }
 
-const unsigned char padding[] = {
-  0x00, 0x00, 0x00, 0x00
-};
+#define IS_SEEKING_FILES 4
+#define IS_PCAP_T_ACTIVE 2
+#define IS_WRITER_ACTIVE 1
 
-void RunThread(int thread, std::vector<std::string> files, uint32_t num_of_files) {
-  if (flag_threads > 1) {
-    LOG_IF_ERROR(SetAffinity(thread), "set affinity");
+
+class RecvThreadCtx {
+ public:
+  RecvThreadCtx() {}
+  RecvThreadCtx(uint32_t recv_id) {
+    pcapng_dirname = flag_dir + "PKT" + std::to_string(recv_id) + "/";
+    index_dirname = flag_dir + "IDX" + std::to_string(recv_id) + "/";
+    CHECK(OpenOrCreateFolder(pcapng_dirname));
+    CHECK(OpenOrCreateFolder(index_dirname));
+    pcapng_writer = new std::ofstream;
+    id = recv_id;
+    file_status = 0;
   }
-  Watchdog dog("Thread " + std::to_string(thread),
-               (flag_watchdogs ? flag_fileage_sec * 2 : -1));
 
-  DropPacketThreadPrivileges();
-  LOG(INFO) << "Thread " << thread << " starting to process";
-  // std::cout << "Thread " << thread << " starting to process\n";
-
-  // All dirnames are guaranteed to end with '/'.
-  std::string pcapng_dirname = flag_dir + "PKT" + std::to_string(thread) + "/";
-  std::string index_dirname = flag_dir + "IDX" + std::to_string(thread) + "/";
-
-  // std::cout << "Thread " << thread << " trying to open " << pcapng_dirname << " and " << index_dirname << "\n";
-
-  CHECK(OpenOrCreateFolder(pcapng_dirname));
-  CHECK(OpenOrCreateFolder(index_dirname));
-
-  // std::cout << "Thread " << thread << " starting to read\n";
-  
-  // for (uint32_t fi = 0; fi < num_of_file && run_threads; fi++) {
-  while (file_iter < num_of_files && run_threads) {
-    std::unique_lock<std::mutex> lock(file_iter_mutex);
-
-    // Error buffer
-    char errbuff[PCAP_ERRBUF_SIZE];
-    uint32_t pkt_count = 0;
-
-    std::string pcap_file_name = files[file_iter];
-    std::string pcap_file_path = flag_pcap + pcap_file_name;
-    
-    // Open file and create pcap handler
-    pcap_t *const pcap_handler = pcap_open_offline(pcap_file_path.c_str(), errbuff);
-    CHECK(pcap_handler != NULL);
-    LOG(INFO) << "Thread " << thread << ": Reading\t\t" << pcap_file_name;   
-    // std::cout << "Thread " << thread << ": Reading\t\t" << pcap_file_name << "\n";   
-    file_iter++;
-    lock.unlock();
-
-    // The header that pcap gives us
-    struct pcap_pkthdr *header_pcap;
-    // The actual packet
-    unsigned char const* full_packet;
-    // This offset will eventually pointed at every enhanced packet block's start
-    // Increase by 28 (bytes) to go to their raw packet data instead
-    uint64_t packet_offset = MIN_SHB_IDB_LEN + 82-28; // maybe +28
-
-    // Index of index file
-    Index* index = NULL;
+  // Create new pcapng file and its index
+  void WriteNewPcapng() {
     int64_t micros = GetCurrentTimeMicros();
-    if (flag_index) {
-      index = new Index(index_dirname, micros);
-    } else {
+    if (!flag_index) {
       LOG(ERROR) << "Indexing turned off";
-    }  
+      return;
+    }
+    index = new Index(index_dirname, micros);
 
+    if (file_status & IS_WRITER_ACTIVE) {
+      pcapng_writer->close();
+      file_status &= ~IS_WRITER_ACTIVE;
+    }
     std::string pcapng_file_path = pcapng_dirname + std::to_string(micros);
-    std::ofstream file(pcapng_file_path);  
-    if (!file.is_open()) {
-      LOG(INFO) << "Error: Unable to open the pcapng file: " << pcapng_file_path;
+    pcapng_writer->open(pcapng_file_path);
+    file_status |= IS_WRITER_ACTIVE;
+
+    if (!pcapng_writer->is_open()) {
+      LOG(INFO) << "Error: Unable to open the pcapng file";
     } else {
       // Section Header Block & Interface Description Block
       SectionHdrBlock shb = SectionHdrBlock();
-      file.write((const char*)&shb, MIN_SHB_LEN);
+      pcapng_writer->write((const char*)&shb, MIN_SHB_LEN);
       IfaceDescBlock idb = IfaceDescBlock(pcap_handler);
-      file.write((const char*)&idb, MIN_IDB_LEN);
+      pcapng_writer->write((const char*)&idb, MIN_IDB_LEN);
     }
+    curr_offset = MIN_SHB_IDB_LEN;
+  }
 
-    // Looping through each packet
-    while (pcap_next_ex(pcap_handler, &header_pcap, &full_packet) >= 0) {
-      EnhancedPktBlock epb = EnhancedPktBlock(header_pcap, full_packet);
+  // Wait until we read a pcap file
+  void FindNewPcap(DIR* directory) {
+    // Read available files
+    if ((file_status & IS_SEEKING_FILES) == 0) {
+      std::unique_lock<std::mutex> lock_iter(file_iter_mutex);
+      curr_pcap_path = "";
+      dirent* entry;
+      while(1){
+        if ((entry = readdir(directory)) == NULL) { 
+          file_status |= IS_SEEKING_FILES;
+          break; // Read all available files, switch to seeking mode
+        }
+        if (entry == NULL || entry->d_type != DT_REG)
+          continue;
 
-      // Write the enhanced packet block to pcapng file
-      file.write((const char*)&epb, EPB_HEADER_LEN);  
-      file.write((const char*)full_packet, epb.get_cap_leng());
-      if (epb.get_num_pads() > 0) {
-        file.write((const char*)padding, epb.get_num_pads());  
+        std::string file_name(entry->d_name);
+        if (isFilePcap(file_name)) {
+          curr_pcap_path = flag_pcap + file_name;
+          break;
+        }
       }
-      file.write((const char*)epb.getptr_blocklen(), 4);  
-
-      // Add packet's key to level-db
-      index->ProcessRaw((unsigned char*)full_packet, packet_offset, epb.get_cap_leng());
-
-      pkt_count++; 
-      // if (pkt_count % 1000000 == 0)
-      //   std::cout << "Offset at packet #" << ++pkt_count << " = " << packet_offset << "\n";    
-      packet_offset += epb.get_blocklen();
+      lock_iter.unlock();
     }
 
-    LOG(INFO) << "Thread " << thread << ": Done reading\t" << pcap_file_name;  
+    // If all files are browsed, find new files
+    if (file_status & IS_SEEKING_FILES) { 
+      std::unique_lock<std::mutex> lock_seeker(file_seeker_mutex);
+      LOG(INFO) << "Thread #" << id << ": Waiting for new files...";
+      while(fileQueue.empty()) {
+        conditionVar.wait(lock_seeker); 
+      }
+      curr_pcap_path = flag_pcap + fileQueue.front();
+      fileQueue.pop();
+      lock_seeker.unlock();
+    }
+    
+    // Error buffer
+    char errbuff[PCAP_ERRBUF_SIZE];
+    if (file_status & IS_PCAP_T_ACTIVE) {
+      pcap_close(pcap_handler);
+      file_status &= ~IS_PCAP_T_ACTIVE;
+    }
+    pcap_handler = pcap_open_offline(curr_pcap_path.c_str(), errbuff);
+    file_status |= IS_PCAP_T_ACTIVE;
+    if (pcap_handler == NULL) {
+      LOG(INFO) << "Can not read " << curr_pcap_path << " -> Skipped";
+      FindNewPcap(directory);
+    }
+    LOG(INFO) << "Thread #" << (int)id << ": Reading     \t" << curr_pcap_path;  
+
+    WriteNewPcapng();
+  }
+
+  void ReachPcapEof() {
+    LOG(INFO) << "Thread #" << (int)id << ": Done reading\t" << curr_pcap_path;  
     LOG_IF_ERROR(index->Flush2(), "index flush");
     delete index;
+    pcapng_writer->close();
+  }
 
-    // Close pcapng file
-    file.close();
+  pcap_t*         pcap_handler;  // Need closing before change (-19 line)
+  std::ofstream*  pcapng_writer; // Need closing before change
+  st::Index*      index;
+  uint32_t        curr_offset;
+  uint16_t        file_status;
+  uint16_t        id;   // padding
+private:
+  std::string     pcapng_dirname;
+  std::string     index_dirname;
+  std::string     curr_pcap_path;
+};
 
-    // Read a file done, so reset timer
+RecvThreadCtx recv_thread_ctx[4];
+
+static void init_file_seeker() {
+  // Monitor directory
+  int fd = inotify_init();
+  CHECK(fd >= 0);
+
+  int wd = inotify_add_watch(fd, flag_pcap.c_str(), IN_CREATE);
+  CHECK(wd >= 0);
+
+  // Suspected
+  char buffer_seeker[512];
+  while (true) {
+    int length = read(fd, buffer_seeker, sizeof(buffer_seeker));
+    CHECK(length >= 0);
+
+    int i = 0;
+    while (i < length) {
+      struct inotify_event *event = (struct inotify_event *)&buffer_seeker[i];
+      if (event->len > 0 && (event->mask & IN_CREATE) && !(event->mask & IN_ISDIR)) {
+        std::lock_guard<std::mutex> lock(file_fetcher);
+        fileQueue.push(event->name);
+        conditionVar.notify_one();
+      }
+      i += sizeof(struct inotify_event) + event->len;
+    }
+  }
+}
+
+static void scde_process_packet(struct pcap_pkthdr *header_pcap, uint8_t *full_packet, int32_t recv_idx){
+  EnhancedPktBlock epb = EnhancedPktBlock(header_pcap, full_packet);
+  int64_t next_offset = recv_thread_ctx[recv_idx].curr_offset + epb.get_blocklen();
+
+  if (next_offset >= (flag_filesize_mb << 20)) {
+    LOG_IF_ERROR(recv_thread_ctx[recv_idx].index->Flush2(), "index flush");
+    recv_thread_ctx[recv_idx].WriteNewPcapng();
+    next_offset = MIN_SHB_IDB_LEN + epb.get_blocklen();
+  }
+
+  // Write the enhanced packet block to pcapng file
+  recv_thread_ctx[recv_idx].pcapng_writer->write((const char*)&epb, EPB_HEADER_LEN);  
+  recv_thread_ctx[recv_idx].pcapng_writer->write((const char*)full_packet, epb.get_cap_leng());
+  if (epb.get_num_pads() > 0) {
+    const unsigned char padding[] = {0x00, 0x00, 0x00};
+    recv_thread_ctx[recv_idx].pcapng_writer->write((const char*)padding, epb.get_num_pads());  
+  }
+  recv_thread_ctx[recv_idx].pcapng_writer->write((const char*)epb.getptr_blocklen(), 4);  
+
+  // Add packet's key to level-db
+  recv_thread_ctx[recv_idx].index->ProcessRaw(
+    (unsigned char*)full_packet, 
+    recv_thread_ctx[recv_idx].curr_offset, 
+    epb.get_cap_leng()
+  );
+
+  recv_thread_ctx[recv_idx].curr_offset = next_offset;  
+}
+
+void RunThread(int thread_id, DIR* directory) {
+  if (flag_threads > 1) {
+    LOG_IF_ERROR(SetAffinity(thread_id), "set affinity");
+  }
+  Watchdog dog("Thread " + std::to_string(thread_id),
+               (flag_watchdogs ? flag_fileage_sec * 2 : -1));
+
+  DropPacketThreadPrivileges();
+  LOG(INFO) << "Thread " << thread_id << " starting to process";
+
+  recv_thread_ctx[thread_id] = RecvThreadCtx(thread_id);
+  
+  while (1) {
+    // WAIT until we found a pcap file and read it
+    recv_thread_ctx[thread_id].FindNewPcap(directory);
+    // The header that pcap gives us
+    struct pcap_pkthdr *header_pcap;
+    // The actual packet
+    unsigned char const *full_packet;
+
+    // Looping through each packet
+    while (pcap_next_ex(recv_thread_ctx[thread_id].pcap_handler, &header_pcap, &full_packet) >= 0) {
+      scde_process_packet(header_pcap, (uint8_t*)full_packet, thread_id);
+    }
+
+    // Read a file done
+    recv_thread_ctx[thread_id].ReachPcapEof();
+
+    // Reset time countdown
     dog.Feed();
   }
 
-  LOG(INFO) << "Finished thread " << thread << " successfully";
+  LOG(INFO) << "Finished thread_id " << thread_id << " successfully";
 }
 
 int Main(int argc, char** argv) {
@@ -529,6 +641,11 @@ int Main(int argc, char** argv) {
 
   uint16_t num_threads = std::thread::hardware_concurrency();
   LOG(INFO) << "Max threads possible: " << num_threads;
+  
+  // Recommended at most 4 cores
+  if (num_threads > 4) num_threads = 4;
+  
+  CHECK(flag_filesize_mb <= 4 << 10);
   CHECK(flag_threads >= 1);
   CHECK(flag_dir != "");
   CHECK(flag_pcap != "");
@@ -542,6 +659,7 @@ int Main(int argc, char** argv) {
   if (flag_pcap[flag_pcap.size() - 1] != '/') {
     flag_pcap += "/";
   }
+  LOG(INFO) << "Max size in MB: " << flag_filesize_mb;
   LOG(INFO) << "Threads used: " << flag_threads;
 
   // To be safe, also set umask before any threads are created.
@@ -561,39 +679,19 @@ int Main(int argc, char** argv) {
   CHECK_SUCCESS(Errno(pthread_sigmask(SIG_BLOCK, &sigset, NULL)));
 
   DIR* directory = opendir(flag_pcap.c_str());
-  if (!directory) {
-    std::cout << "Failed to open the directory: " << flag_pcap << std::endl;
-    return 1;
-  }
-
-  LOG(INFO) << "---*--- START SCANNING ---*---";
-  std::vector<std::string> pcap_files;
-  uint32_t num_of_pcaps = 0;
-
-  dirent* entry;
-  while ((entry = readdir(directory)) != NULL) {
-    if (entry->d_type != DT_REG) {
-      continue;
-    }
-    std::string pcap_file_name(entry->d_name);
-    if (!isFilePcap(pcap_file_name)) {
-      continue;
-    }
-    pcap_files.push_back(pcap_file_name);
-    LOG(INFO) << "Pcap detected: [" << pcap_file_name << "]";
-    num_of_pcaps++;
-  }
-  closedir(directory);
+  CHECK(directory != NULL);
 
   LOG(INFO) << "---*--- START READING ---*---";
   std::vector<std::thread*> index_threads;
-
-  // uint32_t startIndex = 0;
-  // uint32_t endIndex = 0;
   for (int32_t i = 0; i < flag_threads; i++) {
     // Start a new thread and pass the files to it
-    index_threads.emplace_back(new std::thread(&RunThread, i, pcap_files, num_of_pcaps));
-  }
+    index_threads.emplace_back(new std::thread(&RunThread, i, directory));
+    // int initer = packet_shm_init(flag_dir.c_str(), i, scde_process_packet);
+    // LOG(INFO) << "Initer: " << initer;
+  } 
+
+  // Setup new_file seeker
+  init_file_seeker();
 
   // Drop all privileges we need.
   DropCommonThreadPrivileges();
